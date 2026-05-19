@@ -250,7 +250,6 @@ https://app.example.com
 
 - 需要 Nginx 改 Host、Cookie 或跳转。
 - 需要后续自己加 Nginx rewrite/header 规则。
-- 目标网站本身已经套了 Cloudflare CDN，但你仍想经过本机 Nginx。
 
 这个模式不做页面内容替换。
 
@@ -261,6 +260,26 @@ https://app.example.com
 它会尝试把页面里的目标域名替换成你的域名。
 
 但它不是万能的。尤其是目标网站已经套了 Cloudflare CDN、强校验 Host、CSP、CORS、JS 动态生成链接、第三方登录等情况，通常不要选这个。
+
+### Nginx 代理 CF CDN 目标站
+
+适合目标网站本身已经套了 Cloudflare CDN 的情况。
+
+这个模式会：
+
+- 经过本机 Nginx。
+- 保持上游 `Host` 为目标站域名。
+- 对 HTTPS 目标启用 SNI。
+- 把 `Origin`、`Referer`、`X-Forwarded-Host` 尽量设置成目标站域名。
+- 不做页面内容替换。
+
+目标地址建议填写完整 HTTPS 域名，例如：
+
+```text
+https://target.example.com
+```
+
+如果目标站启用了 Cloudflare 的 Bot Fight Mode、WAF、强风控、Turnstile 或严格登录校验，这个模式也不保证一定能过。
 
 ## 常用菜单
 

@@ -358,10 +358,19 @@ render_site_nginx() {
             printf '        proxy_ssl_name %s;\n\n' "$host_only"
         fi
         printf '        proxy_set_header Host %s;\n' "$host_header"
-        printf '        proxy_set_header X-Real-IP $remote_addr;\n'
-        printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
-        printf '        proxy_set_header X-Forwarded-Host $host;\n'
-        printf '        proxy_set_header X-Forwarded-Proto https;\n'
+        if [ "$mode" = "cfcdn" ]; then
+            printf '        proxy_set_header CF-Connecting-IP $remote_addr;\n'
+            printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+            printf '        proxy_set_header X-Forwarded-Proto https;\n'
+            printf '        proxy_set_header X-Forwarded-Host %s;\n' "$host_header"
+            printf '        proxy_set_header Origin %s://%s;\n' "$scheme" "$host_header"
+            printf '        proxy_set_header Referer %s://%s$request_uri;\n' "$scheme" "$host_header"
+        else
+            printf '        proxy_set_header X-Real-IP $remote_addr;\n'
+            printf '        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n'
+            printf '        proxy_set_header X-Forwarded-Host $host;\n'
+            printf '        proxy_set_header X-Forwarded-Proto https;\n'
+        fi
         printf '        proxy_set_header Accept-Encoding "";\n\n'
         printf '        proxy_set_header Upgrade $http_upgrade;\n'
         printf '        proxy_set_header Connection $connection_upgrade;\n\n'
@@ -372,6 +381,12 @@ render_site_nginx() {
         printf '        proxy_cookie_domain .%s .%s;\n' "$host_only" "$hostname"
         printf '        proxy_cookie_domain %s %s;\n' "$upstream_host" "$hostname"
         printf '        proxy_cookie_path / /;\n'
+        if [ "$mode" = "cfcdn" ]; then
+            printf '\n'
+            printf '        proxy_ssl_verify off;\n'
+            printf '        proxy_buffering off;\n'
+            printf '        proxy_request_buffering off;\n'
+        fi
         if [ "$mode" = "mirror" ]; then
             printf '\n'
             printf '        sub_filter_once off;\n'
@@ -415,7 +430,7 @@ has_nginx_site() {
         # shellcheck disable=SC1090
         . "$f"
         case "$MODE" in
-            proxy|mirror) return 0 ;;
+            proxy|mirror|cfcdn) return 0 ;;
         esac
     done
     return 1
@@ -542,6 +557,7 @@ mode_choice_number() {
     case "$1" in
         proxy) printf '2' ;;
         mirror) printf '3' ;;
+        cfcdn) printf '4' ;;
         *) printf '1' ;;
     esac
 }
@@ -553,12 +569,14 @@ choose_mode() {
     printf '%s\n' "1) Cloudflare Tunnel 直连服务（推荐：本机端口、IP:PORT、自建面板、API）" >/dev/tty
     printf '%s\n' "2) Nginx 普通反代（需要 Nginx 处理 Host/Cookie/跳转时用）" >/dev/tty
     printf '%s\n' "3) Nginx 网站镜像反代（仅适合简单网页，会尝试替换页面里的目标域名）" >/dev/tty
+    printf '%s\n' "4) Nginx 代理 CF CDN 目标站（目标站本身套了 Cloudflare 时用）" >/dev/tty
     printf '选择 [%s]: ' "$default_choice" >/dev/tty
     IFS= read -r choice </dev/tty
     [ -n "$choice" ] || choice="$default_choice"
     case "$choice" in
         2) printf 'proxy' ;;
         3) printf 'mirror' ;;
+        4) printf 'cfcdn' ;;
         *) printf 'direct' ;;
     esac
 }
@@ -601,6 +619,8 @@ add_site() {
     custom_host=""
     if [ "$mode" = "direct" ]; then
         service="$target"
+    elif [ "$mode" = "cfcdn" ]; then
+        custom_host="$upstream_host"
     else
         custom_host=$(choose_host_header "$upstream_host")
         if ! validate_host_header "$custom_host"; then
@@ -630,6 +650,7 @@ mode_label() {
         direct) printf 'Tunnel直连' ;;
         proxy) printf 'Nginx普通反代' ;;
         mirror) printf 'Nginx镜像反代' ;;
+        cfcdn) printf 'Nginx代理CF CDN站' ;;
         *) printf '%s' "$1" ;;
     esac
 }
@@ -707,6 +728,8 @@ edit_site() {
     custom_host=""
     if [ "$mode" = "direct" ]; then
         service="$target"
+    elif [ "$mode" = "cfcdn" ]; then
+        custom_host="$upstream_host"
     else
         custom_host=$(choose_host_header "$upstream_host")
         if ! validate_host_header "$custom_host"; then
@@ -722,7 +745,7 @@ edit_site() {
     save_site_env "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service"
     if [ "$mode" = "direct" ]; then
         rm -f "$(site_conf_path "$new_hostname")"
-        if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ]; then
+        if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ]; then
             nginx_reload_safe || warn "旧 Nginx 站点配置已删除，但 Nginx reload 失败，请手动检查。"
         else
             reload_nginx_if_needed || warn "已有 Nginx 站点配置测试失败，请检查 Nginx 配置。"
@@ -754,7 +777,7 @@ delete_site() {
     confirm "确认删除该反代及 Cloudflare DNS/ingress？" || return 0
     backup_managed_files
     rm -f "$(site_conf_path "$HOSTNAME")" "$f"
-    if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ]; then
+    if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ]; then
         if ! nginx_reload_safe; then
             err "删除后 Nginx 配置测试失败。备份位于 $BACKUP_DIR。"
             return 1
