@@ -323,6 +323,12 @@ target_host_only() {
     esac
 }
 
+target_path_prefix() {
+    path=$(printf '%s' "$1" | sed 's#^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*##')
+    [ -n "$path" ] || path="/"
+    printf '%s' "$path"
+}
+
 ensure_crond() {
     rc-update add crond default >/dev/null 2>&1 || true
     rc-service crond start >/dev/null 2>&1 || true
@@ -430,6 +436,7 @@ render_site_nginx() {
     conf=$(site_conf_path "$hostname")
     scheme=$(target_scheme "$target")
     host_only=$(target_host_only "$target")
+    path_prefix=$(target_path_prefix "$target")
     host_header="$upstream_host"
     cert_dir="$CERT_HOME/$hostname"
     [ -n "$custom_host" ] && host_header="$custom_host"
@@ -452,12 +459,19 @@ render_site_nginx() {
             printf '    ssl_protocols TLSv1.2 TLSv1.3;\n'
             printf '    ssl_prefer_server_ciphers off;\n\n'
         fi
+        printf '    resolver 1.1.1.1 8.8.8.8 ipv6=off valid=300s;\n'
+        printf '    resolver_timeout 5s;\n\n'
         printf '    client_max_body_size 100m;\n'
         printf '    proxy_buffers 8 16k;\n'
         printf '    proxy_buffer_size 32k;\n'
         printf '    proxy_busy_buffers_size 64k;\n\n'
         printf '    location / {\n'
-        printf '        proxy_pass %s;\n' "$target"
+        if [ "$scheme" = "https" ]; then
+            printf '        set $proxy_upstream "%s://%s";\n' "$scheme" "$upstream_host"
+            printf '        proxy_pass $proxy_upstream%s;\n' "$path_prefix"
+        else
+            printf '        proxy_pass %s;\n' "$target"
+        fi
         printf '        proxy_http_version 1.1;\n\n'
         if [ "$scheme" = "https" ]; then
             printf '        proxy_ssl_server_name on;\n'
@@ -503,7 +517,7 @@ render_site_nginx() {
         if [ "$mode" = "mirror" ]; then
             printf '\n'
             printf '        sub_filter_once off;\n'
-            printf '        sub_filter_types text/html text/css text/javascript application/javascript application/json application/xml text/xml;\n\n'
+            printf '        sub_filter_types text/css text/javascript application/javascript application/json application/xml text/xml;\n\n'
             printf "        sub_filter 'https://www.%s' 'https://%s';\n" "$host_only" "$hostname"
             printf "        sub_filter 'http://www.%s' 'https://%s';\n" "$host_only" "$hostname"
             printf "        sub_filter 'https://%s' 'https://%s';\n" "$host_only" "$hostname"
