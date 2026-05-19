@@ -516,13 +516,13 @@ cf_sync_ingress() {
 
 choose_mode() {
     printf '%s\n' "请选择反代模式：" >/dev/tty
-    printf '%s\n' "1) 普通反代（跳转/Cookie 改写）" >/dev/tty
-    printf '%s\n' "2) 镜像反代（额外替换响应体域名）" >/dev/tty
-    printf '选择 [2]: ' >/dev/tty
+    printf '%s\n' "1) 后端服务反代（推荐：IP:PORT、自建面板、API、已套 CF CDN 的目标站）" >/dev/tty
+    printf '%s\n' "2) 网站镜像反代（仅适合简单网页，会尝试替换页面里的目标域名）" >/dev/tty
+    printf '选择 [1]: ' >/dev/tty
     IFS= read -r choice </dev/tty
     case "$choice" in
-        1) printf 'proxy' ;;
-        *) printf 'mirror' ;;
+        2) printf 'mirror' ;;
+        *) printf 'proxy' ;;
     esac
 }
 
