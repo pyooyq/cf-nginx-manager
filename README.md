@@ -6,18 +6,26 @@
 
 - 你的 VPS 没有公网 80/443 端口也没关系。
 - 用 Cloudflare Tunnel 把域名流量转进 VPS。
-- VPS 本地用 Nginx 反代到目标网站、IP 或端口。
+- 可以让 Tunnel 直接连到目标服务。
+- 也可以让 Tunnel 先到 VPS 本地 Nginx，再由 Nginx 反代。
 - 新增、修改、删除反代都用菜单完成。
 - 自动帮你配置 Cloudflare DNS 和 Tunnel 入口。
 
-访问链路大概是：
+访问链路有两种：
 
 ```text
+Tunnel 直连模式：
+用户访问你的域名
+  -> Cloudflare
+  -> Cloudflare Tunnel
+  -> 目标服务
+
+Nginx 反代模式：
 用户访问你的域名
   -> Cloudflare
   -> Cloudflare Tunnel
   -> VPS 本地 Nginx 127.0.0.1:8080
-  -> 目标网站 / IP:PORT
+  -> 目标服务
 ```
 
 ## 适合什么场景
@@ -199,13 +207,19 @@ http://1.2.3.4:8080
 example.com
 ```
 
-脚本会自动：
+如果选择 Tunnel 直连模式，脚本会自动：
+
+- 创建 Cloudflare DNS。
+- 更新 Tunnel 入口，让 Tunnel 直接指向目标地址。
+- 不生成 Nginx 配置。
+
+如果选择 Nginx 反代模式，脚本会自动：
 
 - 生成 Nginx 配置。
 - 测试 Nginx 配置。
 - 重载 Nginx。
 - 创建 Cloudflare DNS。
-- 更新 Tunnel 入口。
+- 更新 Tunnel 入口，让 Tunnel 指向 `http://127.0.0.1:8080`。
 
 然后访问：
 
@@ -217,7 +231,7 @@ https://app.example.com
 
 新增反代时会让你选择模式。
 
-### 后端服务反代（默认推荐）
+### Cloudflare Tunnel 直连服务（默认推荐）
 
 适合：
 
@@ -227,11 +241,20 @@ https://app.example.com
 - API。
 - 后台面板。
 - Docker 服务。
-- 目标网站本身已经套了 Cloudflare CDN 的情况。
 
-如果你只是想把自己的服务挂到域名下面，选这个。
+如果你只是想把自己的服务挂到域名下面，选这个。这个模式不经过 Nginx，结构最简单。
 
-### 网站镜像反代
+### Nginx 普通反代
+
+适合：
+
+- 需要 Nginx 改 Host、Cookie 或跳转。
+- 需要后续自己加 Nginx rewrite/header 规则。
+- 目标网站本身已经套了 Cloudflare CDN，但你仍想经过本机 Nginx。
+
+这个模式不做页面内容替换。
+
+### Nginx 网站镜像反代
 
 只适合简单网页镜像。
 

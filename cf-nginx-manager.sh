@@ -313,6 +313,7 @@ save_site_env() {
     mode="$3"
     upstream_host="$4"
     custom_host="$5"
+    service="$6"
     path=$(site_env_path "$hostname")
     tmp="$path.tmp"
     {
@@ -321,6 +322,7 @@ save_site_env() {
         printf 'MODE=%s\n' "$(shell_quote "$mode")"
         printf 'UPSTREAM_HOST=%s\n' "$(shell_quote "$upstream_host")"
         printf 'CUSTOM_HOST=%s\n' "$(shell_quote "$custom_host")"
+        printf 'SERVICE=%s\n' "$(shell_quote "$service")"
         printf 'NGINX_CONF=%s\n' "$(shell_quote "$(site_conf_path "$hostname")")"
     } > "$tmp"
     chmod 600 "$tmp"
@@ -459,7 +461,7 @@ managed_hostnames_json() {
     first=1
     for f in "$SITES_DIR"/*.env; do
         [ -f "$f" ] || continue
-        HOSTNAME=
+        HOSTNAME= SERVICE=
         # shellcheck disable=SC1090
         . "$f"
         [ -n "$HOSTNAME" ] || continue
@@ -481,7 +483,7 @@ managed_ingress_json() {
     first=1
     for f in "$SITES_DIR"/*.env; do
         [ -f "$f" ] || continue
-        HOSTNAME=
+        HOSTNAME= SERVICE=
         # shellcheck disable=SC1090
         . "$f"
         [ -n "$HOSTNAME" ] || continue
@@ -490,7 +492,8 @@ managed_ingress_json() {
         else
             printf ',' >> "$tmp"
         fi
-        jq -cn --arg hostname "$HOSTNAME" --arg service "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}" '{hostname:$hostname,service:$service,originRequest:{}}' >> "$tmp"
+        service="${SERVICE:-${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}}"
+        jq -cn --arg hostname "$HOSTNAME" --arg service "$service" '{hostname:$hostname,service:$service,originRequest:{}}' >> "$tmp"
     done
     printf ']' >> "$tmp"
     cat "$tmp"
@@ -516,13 +519,15 @@ cf_sync_ingress() {
 
 choose_mode() {
     printf '%s\n' "请选择反代模式：" >/dev/tty
-    printf '%s\n' "1) 后端服务反代（推荐：IP:PORT、自建面板、API、已套 CF CDN 的目标站）" >/dev/tty
-    printf '%s\n' "2) 网站镜像反代（仅适合简单网页，会尝试替换页面里的目标域名）" >/dev/tty
+    printf '%s\n' "1) Cloudflare Tunnel 直连服务（推荐：本机端口、IP:PORT、自建面板、API）" >/dev/tty
+    printf '%s\n' "2) Nginx 普通反代（需要 Nginx 处理 Host/Cookie/跳转时用）" >/dev/tty
+    printf '%s\n' "3) Nginx 网站镜像反代（仅适合简单网页，会尝试替换页面里的目标域名）" >/dev/tty
     printf '选择 [1]: ' >/dev/tty
     IFS= read -r choice </dev/tty
     case "$choice" in
-        2) printf 'mirror' ;;
-        *) printf 'proxy' ;;
+        2) printf 'proxy' ;;
+        3) printf 'mirror' ;;
+        *) printf 'direct' ;;
     esac
 }
 
@@ -561,22 +566,41 @@ add_site() {
         return 1
     fi
     mode=$(choose_mode)
-    custom_host=$(choose_host_header "$upstream_host")
-    if ! validate_host_header "$custom_host"; then
-        err "Host 头包含不安全字符。"
-        return 1
+    service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
+    custom_host=""
+    if [ "$mode" = "direct" ]; then
+        service="$target"
+    else
+        custom_host=$(choose_host_header "$upstream_host")
+        if ! validate_host_header "$custom_host"; then
+            err "Host 头包含不安全字符。"
+            return 1
+        fi
     fi
 
     backup_managed_files
-    save_site_env "$hostname" "$target" "$mode" "$upstream_host" "$custom_host"
-    render_site_nginx "$hostname" "$target" "$mode" "$upstream_host" "$custom_host"
-    if ! nginx_reload_safe; then
-        err "Nginx 配置测试失败，请检查 $(site_conf_path "$hostname")。"
-        return 1
+    save_site_env "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service"
+    if [ "$mode" = "direct" ]; then
+        rm -f "$(site_conf_path "$hostname")"
+    else
+        render_site_nginx "$hostname" "$target" "$mode" "$upstream_host" "$custom_host"
+        if ! nginx_reload_safe; then
+            err "Nginx 配置测试失败，请检查 $(site_conf_path "$hostname")。"
+            return 1
+        fi
     fi
     cf_upsert_dns "$hostname" || return 1
     cf_sync_ingress || return 1
-    say "新增完成：https://$hostname -> $target"
+    say "新增完成：https://$hostname -> $target [$mode]"
+}
+
+mode_label() {
+    case "$1" in
+        direct) printf 'Tunnel直连' ;;
+        proxy) printf 'Nginx普通反代' ;;
+        mirror) printf 'Nginx镜像反代' ;;
+        *) printf '%s' "$1" ;;
+    esac
 }
 
 list_sites() {
@@ -586,7 +610,7 @@ list_sites() {
         HOSTNAME= TARGET= MODE=
         # shellcheck disable=SC1090
         . "$f"
-        printf '%s) %s -> %s [%s]\n' "$i" "$HOSTNAME" "$TARGET" "$MODE"
+        printf '%s) %s -> %s [%s]\n' "$i" "$HOSTNAME" "$TARGET" "$(mode_label "$MODE")"
         i=$((i + 1))
     done
     [ "$i" -gt 1 ]
@@ -642,28 +666,39 @@ edit_site() {
         return 1
     fi
     mode=$(choose_mode)
-    custom_host=$(choose_host_header "$upstream_host")
-    if ! validate_host_header "$custom_host"; then
-        err "Host 头包含不安全字符。"
-        return 1
+    service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
+    custom_host=""
+    if [ "$mode" = "direct" ]; then
+        service="$target"
+    else
+        custom_host=$(choose_host_header "$upstream_host")
+        if ! validate_host_header "$custom_host"; then
+            err "Host 头包含不安全字符。"
+            return 1
+        fi
     fi
 
     backup_managed_files
     if [ "$new_hostname" != "$old_hostname" ]; then
         rm -f "$old_conf" "$f"
     fi
-    save_site_env "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host"
-    render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host"
-    if ! nginx_reload_safe; then
-        err "Nginx 配置测试失败。"
-        return 1
+    save_site_env "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service"
+    if [ "$mode" = "direct" ]; then
+        rm -f "$(site_conf_path "$new_hostname")"
+        nginx_reload_safe || warn "Nginx 当前配置测试失败，但直连模式不依赖新 Nginx 配置。"
+    else
+        render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host"
+        if ! nginx_reload_safe; then
+            err "Nginx 配置测试失败。"
+            return 1
+        fi
     fi
     if [ "$new_hostname" != "$old_hostname" ]; then
         cf_delete_dns "$old_hostname" || warn "删除旧 DNS 失败：$old_hostname"
     fi
     cf_upsert_dns "$new_hostname" || return 1
     cf_sync_ingress || return 1
-    say "修改完成：https://$new_hostname -> $target"
+    say "修改完成：https://$new_hostname -> $target [$mode]"
 }
 
 delete_site() {
@@ -706,6 +741,16 @@ show_logs() {
 local_test_site() {
     hostname=$(read_input "要测试的 Host" "")
     [ -n "$hostname" ] || return 1
+    site_file=$(site_env_path "$hostname")
+    if [ -f "$site_file" ]; then
+        MODE= TARGET=
+        # shellcheck disable=SC1090
+        . "$site_file"
+        if [ "$MODE" = "direct" ]; then
+            curl -I "$TARGET"
+            return $?
+        fi
+    fi
     curl -I -H "Host: $hostname" http://127.0.0.1:8080/
 }
 
