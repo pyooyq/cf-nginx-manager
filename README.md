@@ -1,131 +1,240 @@
-# Alpine 3.21 + Cloudflare Tunnel + Nginx 反代一键管理脚本
+# cf-nginx-manager
 
-版本：v4.0（一键脚本 + 手工部署备用）
+这是一个给 Alpine VPS 用的 Cloudflare Tunnel + Nginx 反代管理脚本。
 
-> 适用前提：只反代或镜像你拥有、控制或已获得授权的网站。复杂站点可能受 CSP、CORS、Cookie、OAuth、Service Worker、SRI、JS 动态拼接等机制影响，无法保证 100% 透明镜像。
+它的目的很简单：
 
-## 1. 实现目标
+- 你的 VPS 没有公网 80/443 端口也没关系。
+- 用 Cloudflare Tunnel 把域名流量转进 VPS。
+- VPS 本地用 Nginx 反代到目标网站、IP 或端口。
+- 新增、修改、删除反代都用菜单完成。
+- 自动帮你配置 Cloudflare DNS 和 Tunnel 入口。
 
-在 Alpine NAT VPS 上用 `cloudflared` + Nginx 实现公网反代入口：
+访问链路大概是：
 
 ```text
-用户浏览器
-  -> Cloudflare HTTPS / CDN / WAF
+用户访问你的域名
+  -> Cloudflare
   -> Cloudflare Tunnel
-  -> NAT VPS: 127.0.0.1:8080
-  -> Nginx
-  -> 目标域名 / IP:PORT
+  -> VPS 本地 Nginx 127.0.0.1:8080
+  -> 目标网站 / IP:PORT
 ```
 
-脚本能力：
+## 适合什么场景
 
-- 首次运行自动初始化环境。
-- 自动安装 `nginx`、`curl`、`jq`、`cloudflared` 等依赖。
-- Alpine 3.21 默认仓库没有 `cloudflared` 时，自动追加 `edge/testing` 后安装。
-- 保存 Cloudflare Account ID、Zone ID、API Token、Tunnel ID、Tunnel Token。
-- 新增反代：输入公网域名和目标地址，自动生成 Nginx 配置。
-- 自动创建/更新 Cloudflare DNS CNAME。
-- 自动同步 Cloudflare Tunnel Public Hostname / ingress。
-- 修改、删除已有反代。
-- 管理 `nginx`、`cloudflared` 启动、停止、重启、状态和日志。
+适合：
 
-## 2. 文件说明
+- NAT VPS 没有公网 80/443，但想绑定自己的域名。
+- 给本地服务、面板、API 加一个 HTTPS 域名入口。
+- 简单网站镜像式反代。
+- 用菜单管理多个反代站点。
+
+不保证适合：
+
+- 复杂登录站点。
+- 支付、OAuth、第三方登录。
+- 有严格 CSP、CORS、Service Worker、HSTS 的网站。
+- 需要 100% 完美镜像的大型站点。
+
+## 脚本能做什么
+
+首次运行可以自动：
+
+- 安装 `nginx`、`curl`、`jq`、`cloudflared` 等依赖。
+- Alpine 3.21 默认仓库没有 `cloudflared` 时，自动添加 `edge/testing` 仓库安装。
+- 保存 Cloudflare API 信息和 Tunnel Token。
+- 创建 `cloudflared` 的 OpenRC 服务。
+- 设置 `nginx` 和 `cloudflared` 开机自启。
+
+日常使用可以：
+
+- 新增反代。
+- 修改反代。
+- 删除反代。
+- 查看反代列表。
+- 自动创建 Cloudflare DNS CNAME。
+- 自动更新 Cloudflare Tunnel Public Hostname。
+- 启动、停止、重启 `nginx` 和 `cloudflared`。
+
+## 一键运行
+
+### curl 方式
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/pyooyq/cf-nginx-manager/main/cf-nginx-manager.sh -o /usr/local/bin/cf-nginx-manager && chmod +x /usr/local/bin/cf-nginx-manager && cf-nginx-manager
+```
+
+如果 `/usr/local/bin` 不存在或不想安装到系统路径，可以临时运行：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/pyooyq/cf-nginx-manager/main/cf-nginx-manager.sh -o cf-nginx-manager.sh && chmod +x cf-nginx-manager.sh && ./cf-nginx-manager.sh
+```
+
+### wget 方式
+
+```sh
+wget -O /usr/local/bin/cf-nginx-manager https://raw.githubusercontent.com/pyooyq/cf-nginx-manager/main/cf-nginx-manager.sh && chmod +x /usr/local/bin/cf-nginx-manager && cf-nginx-manager
+```
+
+临时运行：
+
+```sh
+wget -O cf-nginx-manager.sh https://raw.githubusercontent.com/pyooyq/cf-nginx-manager/main/cf-nginx-manager.sh && chmod +x cf-nginx-manager.sh && ./cf-nginx-manager.sh
+```
+
+## 第一次怎么用
+
+运行脚本后，先选：
 
 ```text
-cf-nginx-manager.sh   # 一键管理脚本
-README.md             # 使用文档
+1) 首次初始化 / 修复环境
 ```
 
-脚本在 VPS 上会管理这些路径：
+然后脚本会要求你输入 Cloudflare 信息。
+
+需要准备这些东西：
 
 ```text
-/etc/cf-nginx-manager/config.env              # Cloudflare 凭据，权限 0600
-/etc/cf-nginx-manager/sites.d/*.env           # 站点元数据
-/etc/cf-nginx-manager/backups/                # 配置备份
-/etc/nginx/http.d/00-cf-nginx-manager-map.conf
-/etc/nginx/http.d/cf-nginx-manager-*.conf
-/etc/init.d/cloudflared
-/var/log/cloudflared.log
+Cloudflare Account ID
+Cloudflare Zone ID
+Cloudflare API Token
+Cloudflare Tunnel ID
+Cloudflare Tunnel Token
 ```
 
-脚本只管理 `cf-nginx-manager-*` 相关 Nginx 配置，不会主动覆盖其他站点配置。
+这些信息准备好后，脚本会保存到：
 
-## 3. Cloudflare 准备工作
+```text
+/etc/cf-nginx-manager/config.env
+```
 
-你需要先在 Cloudflare 准备：
+文件权限会设置为 `0600`。
 
-1. 一个已经添加到 Cloudflare 的域名，例如 `example.com`。
+## Cloudflare 需要准备什么
+
+你需要：
+
+1. 一个已经托管到 Cloudflare 的域名。
 2. 一个 Cloudflare Tunnel。
-3. Tunnel ID。
-4. Tunnel Token。
-5. Account ID。
-6. Zone ID。
-7. Cloudflare API Token。
+3. 一个有权限操作 DNS 和 Tunnel 的 API Token。
 
-API Token 推荐权限：
+## 怎么获取 Account ID 和 Zone ID
+
+打开 Cloudflare 网站：
+
+1. 进入你的域名。
+2. 右侧边栏可以看到：
+   - `Account ID`
+   - `Zone ID`
+3. 复制下来，后面脚本会用到。
+
+## 怎么创建 API Token
+
+进入 Cloudflare：
+
+```text
+My Profile -> API Tokens -> Create Token
+```
+
+可以选择自定义 Token。
+
+需要给这些权限：
 
 ```text
 Account / Cloudflare Tunnel / Edit
 Zone / DNS / Edit
 ```
 
-资源范围建议限制到对应 Account 和 Zone。
+资源范围建议只选你的账号和你的域名，不要给全局权限。
 
-脚本使用 Cloudflare API 自动执行两件事：
+创建完成后复制 API Token。这个 Token 只显示一次，注意保存。
 
-- 创建或更新 DNS：
+## 怎么创建 Cloudflare Tunnel
 
-```text
-app.example.com CNAME <TUNNEL_ID>.cfargotunnel.com proxied=true
-```
-
-- 更新 Tunnel ingress：
-
-```json
-{
-  "hostname": "app.example.com",
-  "service": "http://127.0.0.1:8080",
-  "originRequest": {}
-}
-```
-
-## 4. 快速开始
-
-把脚本上传到 Alpine VPS 后执行：
-
-```sh
-chmod +x cf-nginx-manager.sh
-./cf-nginx-manager.sh
-```
-
-首次菜单选择：
+进入 Cloudflare Zero Trust：
 
 ```text
-1) 首次初始化 / 修复环境
+Networks -> Tunnels -> Create a tunnel
 ```
 
-脚本会：
+选择 `cloudflared`。
 
-- 安装依赖。
-- 检测并安装 `cloudflared`。
-- 创建 `/etc/cf-nginx-manager`。
-- 创建 `/etc/init.d/cloudflared`。
-- 写入 Nginx 全局 WebSocket map。
-- 设置 `nginx` 和 `cloudflared` 开机自启。
-- 让你输入 Cloudflare API / Tunnel 信息。
-- 重启 `nginx` 和 `cloudflared`。
+创建完成后你会看到安装命令，里面有一长串 token，例如：
 
-如果 Alpine 3.21 提示默认仓库没有 `cloudflared`，脚本会自动执行等价逻辑：
+```text
+cloudflared tunnel run --token xxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+复制 `--token` 后面的完整内容，这就是 `Cloudflare Tunnel Token`。
+
+Tunnel ID 可以在 Tunnel 详情页看到，也可以从 Cloudflare 后台复制。
+
+## 新增一个反代
+
+运行脚本：
 
 ```sh
-printf '%s\n' 'http://dl-cdn.alpinelinux.org/alpine/edge/testing' >> /etc/apk/repositories
-apk update
-apk add --no-cache cloudflared
+cf-nginx-manager
 ```
 
-## 5. 菜单功能
+选择：
 
-主菜单：
+```text
+3) 反代管理
+1) 新增反代
+```
+
+然后输入：
+
+```text
+公网域名：app.example.com
+目标地址：https://target.example.com
+```
+
+目标地址也可以是：
+
+```text
+http://1.2.3.4:8080
+127.0.0.1:3000
+example.com
+```
+
+脚本会自动：
+
+- 生成 Nginx 配置。
+- 测试 Nginx 配置。
+- 重载 Nginx。
+- 创建 Cloudflare DNS。
+- 更新 Tunnel 入口。
+
+然后访问：
+
+```text
+https://app.example.com
+```
+
+## 普通反代和镜像反代怎么选
+
+新增反代时会让你选择模式。
+
+### 普通反代
+
+适合：
+
+- API。
+- 后台面板。
+- 本地服务。
+- Docker 服务。
+
+### 镜像反代
+
+适合简单网页镜像。
+
+它会尝试把页面里的目标域名替换成你的域名。
+
+但它不是万能的。JS 动态生成、加密内容、CSP、CORS、第三方登录等情况可能无法完全处理。
+
+## 常用菜单
 
 ```text
 1) 首次初始化 / 修复环境
@@ -136,393 +245,73 @@ apk add --no-cache cloudflared
 0) 退出
 ```
 
-反代管理：
+服务管理里可以：
 
-```text
-1) 新增反代
-2) 修改反代
-3) 删除反代
-4) 查看反代列表
-5) 同步 Cloudflare Tunnel ingress
-0) 返回
-```
+- 启动 Nginx。
+- 停止 Nginx。
+- 重启 Nginx。
+- 测试 Nginx 配置。
+- 启动 cloudflared。
+- 停止 cloudflared。
+- 重启 cloudflared。
+- 查看 cloudflared 日志。
 
-服务管理：
-
-```text
-1) nginx start
-2) nginx stop
-3) nginx restart
-4) nginx reload
-5) nginx status
-6) nginx -t
-7) cloudflared start
-8) cloudflared stop
-9) cloudflared restart
-10) cloudflared status
-11) 查看 cloudflared 日志
-12) 查看 127.0.0.1:8080 监听
-13) 本地 Host 测试
-0) 返回
-```
-
-## 6. 新增反代示例
-
-运行：
+## 常用检查命令
 
 ```sh
-./cf-nginx-manager.sh
-```
-
-选择：
-
-```text
-3) 反代管理
-1) 新增反代
-```
-
-输入示例：
-
-```text
-公网域名：app.example.com
-目标地址：https://target.example.org
-反代模式：镜像反代
-Host 头策略：使用上游 Host
-```
-
-脚本会自动：
-
-1. 写入 Nginx 配置：
-
-```text
-/etc/nginx/http.d/cf-nginx-manager-app_example_com.conf
-```
-
-2. 执行：
-
-```sh
-nginx -t
-rc-service nginx reload
-```
-
-3. 创建或更新 Cloudflare DNS：
-
-```text
-app.example.com -> <TUNNEL_ID>.cfargotunnel.com
-```
-
-4. 同步 Tunnel ingress。
-
-5. 访问：
-
-```text
-https://app.example.com
-```
-
-## 7. 支持的目标地址格式
-
-支持：
-
-```text
-example.com
-https://example.com
-http://example.com
-1.2.3.4:8080
-http://1.2.3.4:8080
-127.0.0.1:3000
-```
-
-自动推导规则：
-
-- `example.com` 默认变成 `https://example.com`。
-- `1.2.3.4:8080` 默认变成 `http://1.2.3.4:8080`。
-- `https://...` 自动启用 SNI：
-
-```nginx
-proxy_ssl_server_name on;
-proxy_ssl_name <上游host>;
-```
-
-## 8. 普通反代 vs 镜像反代
-
-### 普通反代
-
-适合 API、面板、简单后端服务。
-
-主要处理：
-
-- `proxy_pass`
-- `proxy_redirect`
-- `proxy_cookie_domain`
-- WebSocket
-
-### 镜像反代
-
-适合简单网站镜像。
-
-在普通反代基础上增加：
-
-```nginx
-proxy_set_header Accept-Encoding "";
-sub_filter_once off;
-sub_filter_types text/html text/css text/javascript application/javascript application/json application/xml text/xml;
-sub_filter 'https://目标域名' 'https://你的域名';
-sub_filter 'http://目标域名' 'https://你的域名';
-sub_filter '//目标域名' '//你的域名';
-sub_filter '目标域名' '你的域名';
-```
-
-注意：Nginx `sub_filter` 语法没有尾部 `g`，全局替换依靠：
-
-```nginx
-sub_filter_once off;
-```
-
-## 9. 脚本命令参数
-
-除了菜单，也可以直接运行部分命令：
-
-```sh
-./cf-nginx-manager.sh init      # 初始化环境
-./cf-nginx-manager.sh config    # 配置 Cloudflare 凭据
-./cf-nginx-manager.sh add       # 新增反代
-./cf-nginx-manager.sh list      # 查看反代列表
-./cf-nginx-manager.sh sync      # 同步 Tunnel ingress
-./cf-nginx-manager.sh services  # 服务管理菜单
-```
-
-## 10. 验证部署
-
-基础检查：
-
-```sh
-cloudflared --version
-nginx -v
 nginx -t
 rc-service nginx status
 rc-service cloudflared status
-rc-update show | grep -E 'nginx|cloudflared'
-```
-
-确认 Nginx 只监听本地：
-
-```sh
 ss -tlnp | grep ':8080'
+tail -n 100 /var/log/cloudflared.log
 ```
 
-预期类似：
-
-```text
-LISTEN 0 511 127.0.0.1:8080 0.0.0.0:* users:(("nginx",pid=...,fd=...))
-```
-
-本机 Host 测试：
+测试本地 Nginx：
 
 ```sh
 curl -I -H 'Host: app.example.com' http://127.0.0.1:8080/
 ```
 
-公网测试：
+测试公网访问：
 
 ```sh
 curl -I https://app.example.com/
 ```
 
-浏览器检查：
+## 安全说明
 
-- 页面是否能打开。
-- 地址栏是否保持你的域名。
-- 图片、CSS、JS 是否正常加载。
-- 登录态 Cookie 是否写入你的域名。
-- Network 面板是否仍大量请求目标域名。
+脚本会保存 Cloudflare API Token 和 Tunnel Token，请只在你自己的 VPS 上运行。
 
-## 11. 常见问题
+脚本只管理这些文件：
 
-### 11.1 `apk add cloudflared` 提示 no such package
+```text
+/etc/cf-nginx-manager/
+/etc/nginx/http.d/cf-nginx-manager-*.conf
+/etc/nginx/http.d/00-cf-nginx-manager-map.conf
+/etc/init.d/cloudflared
+```
 
-Alpine 3.21 默认仓库可能没有 `cloudflared`。脚本会自动追加：
+修改前会备份到：
+
+```text
+/etc/cf-nginx-manager/backups/
+```
+
+删除反代前会二次确认。
+
+## 卸载
+
+如果你不想用了，可以手动删除：
 
 ```sh
-http://dl-cdn.alpinelinux.org/alpine/edge/testing
-```
-
-然后重新：
-
-```sh
-apk update
-apk add --no-cache cloudflared
-```
-
-你已经手动这样安装成功，脚本后续检测到 `cloudflared` 已存在会跳过安装。
-
-### 11.2 Cloudflare API 同步失败
-
-检查：
-
-- Account ID 是否正确。
-- Zone ID 是否正确。
-- Tunnel ID 是否正确。
-- API Token 是否有：
-  - Account / Cloudflare Tunnel / Edit
-  - Zone / DNS / Edit
-- 域名是否属于该 Zone。
-
-### 11.3 Cloudflare 显示 502 / 1033 / Tunnel disconnected
-
-检查：
-
-```sh
-rc-service cloudflared status
-tail -n 100 /var/log/cloudflared.log
-curl -I -H 'Host: app.example.com' http://127.0.0.1:8080/
-```
-
-常见原因：
-
-- Tunnel Token 错误。
-- `cloudflared` 未启动。
-- Nginx 未启动。
-- Tunnel ingress 没同步成功。
-
-### 11.4 `nginx -t` 报 `invalid number of arguments in "sub_filter" directive`
-
-错误写法：
-
-```nginx
-sub_filter 'https://b.com' 'https://a.com' g;
-```
-
-正确写法：
-
-```nginx
-sub_filter 'https://b.com' 'https://a.com';
-```
-
-### 11.5 页面能打开，但源码仍有目标域名
-
-常见原因：
-
-- JS 运行时拼接域名。
-- Base64、protobuf、wasm、加密配置里包含域名。
-- 还有 `api.example.com`、`static.example.com`、`cdn.example.com` 等子域名没配置。
-- 目标站 CSP/CORS/SRI/HSTS 限制。
-
-Nginx `sub_filter` 只能替换明文响应体，不是万能全站重写引擎。
-
-## 12. 安全和回滚
-
-脚本安全策略：
-
-- 敏感配置保存为 `0600`。
-- 只管理 `/etc/nginx/http.d/cf-nginx-manager-*.conf`。
-- 修改前备份到 `/etc/cf-nginx-manager/backups/<时间>/`。
-- `nginx -t` 失败不会 reload。
-- 删除站点前需要二次确认。
-- 不执行 `apk upgrade -a`，避免升级整个系统。
-- 同步 Tunnel ingress 时会保留非本脚本管理的 hostname。
-
-如果需要手动回滚，可以从备份目录恢复对应文件后执行：
-
-```sh
-nginx -t
+rc-service cloudflared stop
 rc-service nginx reload
-./cf-nginx-manager.sh sync
+rc-update del cloudflared default
+rm -rf /etc/cf-nginx-manager
+rm -f /etc/nginx/http.d/cf-nginx-manager-*.conf
+rm -f /etc/nginx/http.d/00-cf-nginx-manager-map.conf
+rm -f /etc/init.d/cloudflared
+nginx -t && rc-service nginx reload
 ```
 
-## 13. 手工部署备用方案
-
-如果不想使用脚本，可以手工部署。
-
-### 13.1 安装软件
-
-```sh
-apk update
-apk add --no-cache nginx curl ca-certificates openssl openrc jq
-```
-
-安装 `cloudflared`：
-
-```sh
-apk add --no-cache cloudflared || {
-  printf '%s\n' 'http://dl-cdn.alpinelinux.org/alpine/edge/testing' >> /etc/apk/repositories
-  apk update
-  apk add --no-cache cloudflared
-}
-```
-
-### 13.2 Nginx 示例配置
-
-创建 `/etc/nginx/http.d/mirror.conf`：
-
-```nginx
-map $http_upgrade $connection_upgrade {
-    default upgrade;
-    '' close;
-}
-
-server {
-    listen 127.0.0.1:8080;
-    server_name a.com www.a.com;
-
-    client_max_body_size 100m;
-
-    location / {
-        proxy_pass https://b.com;
-        proxy_http_version 1.1;
-
-        proxy_ssl_server_name on;
-        proxy_ssl_name b.com;
-
-        proxy_set_header Host b.com;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Host $host;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header Accept-Encoding "";
-
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-
-        proxy_redirect https://b.com/ https://a.com/;
-        proxy_redirect http://b.com/ https://a.com/;
-
-        proxy_cookie_domain b.com a.com;
-        proxy_cookie_domain .b.com .a.com;
-        proxy_cookie_path / /;
-
-        sub_filter_once off;
-        sub_filter_types text/html text/css text/javascript application/javascript application/json application/xml text/xml;
-        sub_filter 'https://b.com' 'https://a.com';
-        sub_filter 'http://b.com' 'https://a.com';
-        sub_filter '//b.com' '//a.com';
-        sub_filter 'b.com' 'a.com';
-    }
-}
-```
-
-启动：
-
-```sh
-nginx -t
-rc-service nginx restart
-rc-update add nginx default
-```
-
-### 13.3 cloudflared OpenRC 示例
-
-```sh
-cat > /etc/init.d/cloudflared <<'EOF'
-#!/sbin/openrc-run
-name="cloudflared"
-command="/usr/bin/cloudflared"
-command_args="tunnel run --token 你的完整TunnelToken"
-pidfile="/run/cloudflared.pid"
-command_background=true
-depend() { need net; }
-EOF
-chmod +x /etc/init.d/cloudflared
-rc-update add cloudflared default
-rc-service cloudflared restart
-```
-
-手工方案下，Cloudflare DNS 和 Public Hostname 需要你在后台或 API 里自行配置。
+Cloudflare 上已经创建的 DNS 和 Tunnel Public Hostname，建议先用脚本删除反代，再卸载。否则需要到 Cloudflare 后台手动删除。
