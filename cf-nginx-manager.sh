@@ -408,6 +408,27 @@ nginx_reload_safe() {
     return 1
 }
 
+has_nginx_site() {
+    for f in "$SITES_DIR"/*.env; do
+        [ -f "$f" ] || continue
+        MODE=
+        # shellcheck disable=SC1090
+        . "$f"
+        case "$MODE" in
+            proxy|mirror) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+reload_nginx_if_needed() {
+    if has_nginx_site; then
+        nginx_reload_safe
+    else
+        return 0
+    fi
+}
+
 cf_api() {
     method="$1"
     path="$2"
@@ -517,13 +538,24 @@ cf_sync_ingress() {
     cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body" | jq -e '.success == true' >/dev/null
 }
 
+mode_choice_number() {
+    case "$1" in
+        proxy) printf '2' ;;
+        mirror) printf '3' ;;
+        *) printf '1' ;;
+    esac
+}
+
 choose_mode() {
+    default_mode="${1:-direct}"
+    default_choice=$(mode_choice_number "$default_mode")
     printf '%s\n' "请选择反代模式：" >/dev/tty
     printf '%s\n' "1) Cloudflare Tunnel 直连服务（推荐：本机端口、IP:PORT、自建面板、API）" >/dev/tty
     printf '%s\n' "2) Nginx 普通反代（需要 Nginx 处理 Host/Cookie/跳转时用）" >/dev/tty
     printf '%s\n' "3) Nginx 网站镜像反代（仅适合简单网页，会尝试替换页面里的目标域名）" >/dev/tty
-    printf '选择 [1]: ' >/dev/tty
+    printf '选择 [%s]: ' "$default_choice" >/dev/tty
     IFS= read -r choice </dev/tty
+    [ -n "$choice" ] || choice="$default_choice"
     case "$choice" in
         2) printf 'proxy' ;;
         3) printf 'mirror' ;;
@@ -547,7 +579,6 @@ choose_host_header() {
 add_site() {
     require_config || return 1
     ensure_dirs
-    render_nginx_map
     hostname=$(read_input "公网域名，例如 app.example.com" "")
     if ! validate_hostname "$hostname"; then
         err "域名格式不正确。"
@@ -565,7 +596,7 @@ add_site() {
         err "无法从目标地址解析出安全的上游 Host。"
         return 1
     fi
-    mode=$(choose_mode)
+    mode=$(choose_mode direct)
     service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
     custom_host=""
     if [ "$mode" = "direct" ]; then
@@ -631,7 +662,7 @@ site_file_by_number() {
 }
 
 select_site_file() {
-    if ! list_sites; then
+    if ! list_sites >/dev/tty; then
         err "当前没有站点。"
         return 1
     fi
@@ -647,6 +678,7 @@ edit_site() {
     # shellcheck disable=SC1090
     . "$f"
     old_hostname="$HOSTNAME"
+    old_mode="$MODE"
     old_conf=$(site_conf_path "$old_hostname")
 
     new_hostname=$(read_input "公网域名" "$HOSTNAME")
@@ -665,7 +697,7 @@ edit_site() {
         err "无法从目标地址解析出安全的上游 Host。"
         return 1
     fi
-    mode=$(choose_mode)
+    mode=$(choose_mode "${MODE:-direct}")
     service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
     custom_host=""
     if [ "$mode" = "direct" ]; then
@@ -685,7 +717,11 @@ edit_site() {
     save_site_env "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service"
     if [ "$mode" = "direct" ]; then
         rm -f "$(site_conf_path "$new_hostname")"
-        nginx_reload_safe || warn "Nginx 当前配置测试失败，但直连模式不依赖新 Nginx 配置。"
+        if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ]; then
+            nginx_reload_safe || warn "旧 Nginx 站点配置已删除，但 Nginx reload 失败，请手动检查。"
+        else
+            reload_nginx_if_needed || warn "已有 Nginx 站点配置测试失败，请检查 Nginx 配置。"
+        fi
     else
         render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host"
         if ! nginx_reload_safe; then
@@ -704,14 +740,20 @@ edit_site() {
 delete_site() {
     require_config || return 1
     f=$(select_site_file) || return 1
-    HOSTNAME= TARGET=
+    HOSTNAME= TARGET= MODE=
     # shellcheck disable=SC1090
     . "$f"
+    old_mode="$MODE"
     say "将删除：$HOSTNAME -> $TARGET"
     confirm "确认删除该反代及 Cloudflare DNS/ingress？" || return 0
     backup_managed_files
     rm -f "$(site_conf_path "$HOSTNAME")" "$f"
-    if ! nginx_reload_safe; then
+    if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ]; then
+        if ! nginx_reload_safe; then
+            err "删除后 Nginx 配置测试失败。备份位于 $BACKUP_DIR。"
+            return 1
+        fi
+    elif ! reload_nginx_if_needed; then
         err "删除后 Nginx 配置测试失败。备份位于 $BACKUP_DIR。"
         return 1
     fi
