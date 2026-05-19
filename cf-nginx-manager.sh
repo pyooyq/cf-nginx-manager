@@ -15,7 +15,7 @@ CF_API_BASE="https://api.cloudflare.com/client/v4"
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
-pause() { printf '\n按回车继续... '; read -r _; }
+pause() { printf '\n按回车继续... ' >/dev/tty; IFS= read -r _ </dev/tty; }
 
 need_root() {
     if [ "$(id -u)" != "0" ]; then
@@ -32,7 +32,7 @@ read_input() {
     else
         printf '%s: ' "$prompt" >/dev/tty
     fi
-    read -r value
+    IFS= read -r value </dev/tty
     if [ -z "$value" ]; then
         value="$default"
     fi
@@ -42,17 +42,17 @@ read_input() {
 read_secret() {
     prompt="$1"
     printf '%s: ' "$prompt" >/dev/tty
-    stty -echo 2>/dev/null || true
-    read -r value
-    stty echo 2>/dev/null || true
+    stty -echo </dev/tty 2>/dev/null || true
+    IFS= read -r value </dev/tty
+    stty echo </dev/tty 2>/dev/null || true
     printf '\n' >/dev/tty
     printf '%s' "$value"
 }
 
 confirm() {
     prompt="$1"
-    printf '%s [y/N]: ' "$prompt"
-    read -r answer
+    printf '%s [y/N]: ' "$prompt" >/dev/tty
+    IFS= read -r answer </dev/tty
     case "$answer" in
         y|Y|yes|YES) return 0 ;;
         *) return 1 ;;
@@ -519,7 +519,7 @@ choose_mode() {
     printf '%s\n' "1) 普通反代（跳转/Cookie 改写）" >/dev/tty
     printf '%s\n' "2) 镜像反代（额外替换响应体域名）" >/dev/tty
     printf '选择 [2]: ' >/dev/tty
-    read -r choice
+    IFS= read -r choice </dev/tty
     case "$choice" in
         1) printf 'proxy' ;;
         *) printf 'mirror' ;;
@@ -532,7 +532,7 @@ choose_host_header() {
     printf '%s\n' "1) 使用上游 Host：$upstream_host（推荐）" >/dev/tty
     printf '%s\n' "2) 自定义 Host" >/dev/tty
     printf '选择 [1]: ' >/dev/tty
-    read -r choice
+    IFS= read -r choice </dev/tty
     case "$choice" in
         2) read_input "自定义 Host" "$upstream_host" ;;
         *) printf '%s' "$upstream_host" ;;
@@ -611,8 +611,8 @@ select_site_file() {
         err "当前没有站点。"
         return 1
     fi
-    printf '选择站点编号: '
-    read -r n
+    printf '选择站点编号: ' >/dev/tty
+    IFS= read -r n </dev/tty
     site_file_by_number "$n"
 }
 
@@ -727,8 +727,8 @@ manage_services() {
         say "12) 查看 127.0.0.1:8080 监听"
         say "13) 本地 Host 测试"
         say "0) 返回"
-        printf '选择: '
-        read -r c
+        printf '选择: ' >/dev/tty
+        IFS= read -r c </dev/tty
         case "$c" in
             1) service_action nginx start ;;
             2) service_action nginx stop ;;
@@ -760,8 +760,8 @@ site_menu() {
         say "4) 查看反代列表"
         say "5) 同步 Cloudflare Tunnel ingress"
         say "0) 返回"
-        printf '选择: '
-        read -r c
+        printf '选择: ' >/dev/tty
+        IFS= read -r c </dev/tty
         case "$c" in
             1) add_site ;;
             2) edit_site ;;
@@ -788,8 +788,8 @@ main_menu() {
         say "4) 服务管理"
         say "5) 查看当前配置"
         say "0) 退出"
-        printf '选择: '
-        read -r c
+        printf '选择: ' >/dev/tty
+        IFS= read -r c </dev/tty
         case "$c" in
             1) init_environment ;;
             2) configure_credentials ;;

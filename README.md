@@ -90,7 +90,7 @@ wget -O cf-nginx-manager.sh https://raw.githubusercontent.com/pyooyq/cf-nginx-ma
 1) 首次初始化 / 修复环境
 ```
 
-然后脚本会要求你输入 Cloudflare 信息。
+然后脚本会逐项提示你输入 Cloudflare 信息，例如 `Cloudflare Account ID:`、`Cloudflare Zone ID:`。如果看到这些提示，就按提示粘贴对应内容后回车。
 
 需要准备这些东西：
 
