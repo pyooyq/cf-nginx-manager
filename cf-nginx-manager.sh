@@ -10,12 +10,40 @@ NGINX_PREFIX="/etc/nginx/http.d/cf-nginx-manager-"
 CLOUDFLARED_INIT="/etc/init.d/cloudflared"
 CLOUDFLARED_LOG="/var/log/cloudflared.log"
 LOCAL_SERVICE_DEFAULT="http://127.0.0.1:8080"
+ACME_HOME="/root/.acme.sh"
+CERT_HOME="/etc/nginx/certs"
 CF_API_BASE="https://api.cloudflare.com/client/v4"
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
-pause() { printf '\n按回车继续... ' >/dev/tty; IFS= read -r _ </dev/tty; }
+pause() { printf '\n\033[2m按回车继续...\033[0m ' >/dev/tty; IFS= read -r _ </dev/tty; }
+clear_screen() { printf '\033c' >/dev/tty; }
+
+C_RESET='\033[0m'
+C_DIM='\033[2m'
+C_RED='\033[31m'
+C_GREEN='\033[32m'
+C_YELLOW='\033[33m'
+C_BLUE='\033[34m'
+C_CYAN='\033[36m'
+C_BOLD='\033[1m'
+
+ui_line() { printf '%b\n' "${C_BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"; }
+ui_header() {
+    clear_screen
+    ui_line
+    printf '%b\n' "${C_BOLD}${C_CYAN}  $1${C_RESET}"
+    ui_line
+    printf '\n'
+}
+ui_section() { printf '%b\n' "${C_BOLD}${C_BLUE}$1${C_RESET}"; }
+ui_menu_item() { printf '  %b%2s%b) %s\n' "$C_CYAN" "$1" "$C_RESET" "$2"; }
+ui_back_item() { printf '  %b%2s%b) %s\n' "$C_DIM" "$1" "$C_RESET" "$2"; }
+ui_prompt() { printf '\n%b选择:%b ' "$C_BOLD" "$C_RESET" >/dev/tty; }
+ui_ok() { printf '%b%s%b' "$C_GREEN" "$1" "$C_RESET"; }
+ui_warn() { printf '%b%s%b' "$C_YELLOW" "$1" "$C_RESET"; }
+ui_bad() { printf '%b%s%b' "$C_RED" "$1" "$C_RESET"; }
 
 need_root() {
     if [ "$(id -u)" != "0" ]; then
@@ -80,7 +108,7 @@ site_conf_path() {
 }
 
 ensure_dirs() {
-    mkdir -p "$CONFIG_DIR" "$SITES_DIR" "$BACKUP_DIR" /var/log/cf-nginx-manager
+    mkdir -p "$CONFIG_DIR" "$SITES_DIR" "$BACKUP_DIR" "$CERT_HOME" /var/log/cf-nginx-manager
     chmod 700 "$CONFIG_DIR" 2>/dev/null || true
     chmod 700 "$SITES_DIR" 2>/dev/null || true
 }
@@ -97,11 +125,11 @@ save_config() {
     ensure_dirs
     tmp="$CONFIG_ENV.tmp"
     {
-        printf 'CF_ACCOUNT_ID=%s\n' "$(shell_quote "$CF_ACCOUNT_ID")"
-        printf 'CF_ZONE_ID=%s\n' "$(shell_quote "$CF_ZONE_ID")"
-        printf 'CF_API_TOKEN=%s\n' "$(shell_quote "$CF_API_TOKEN")"
-        printf 'CF_TUNNEL_ID=%s\n' "$(shell_quote "$CF_TUNNEL_ID")"
-        printf 'CF_TUNNEL_TOKEN=%s\n' "$(shell_quote "$CF_TUNNEL_TOKEN")"
+        printf 'CF_ACCOUNT_ID=%s\n' "$(shell_quote "${CF_ACCOUNT_ID:-}")"
+        printf 'CF_ZONE_ID=%s\n' "$(shell_quote "${CF_ZONE_ID:-}")"
+        printf 'CF_API_TOKEN=%s\n' "$(shell_quote "${CF_API_TOKEN:-}")"
+        printf 'CF_TUNNEL_ID=%s\n' "$(shell_quote "${CF_TUNNEL_ID:-}")"
+        printf 'CF_TUNNEL_TOKEN=%s\n' "$(shell_quote "${CF_TUNNEL_TOKEN:-}")"
         printf 'LOCAL_SERVICE=%s\n' "$(shell_quote "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}")"
     } > "$tmp"
     chmod 600 "$tmp"
@@ -141,6 +169,19 @@ require_config() {
     if [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${CF_ZONE_ID:-}" ] || [ -z "${CF_API_TOKEN:-}" ] || [ -z "${CF_TUNNEL_ID:-}" ] || [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
         err "尚未配置 Cloudflare 信息，请先执行初始化或配置 Cloudflare 凭据。"
         return 1
+    fi
+}
+
+require_cf_api_token() {
+    load_config
+    if [ -z "${CF_API_TOKEN:-}" ]; then
+        say "公网入站反代申请证书需要 Cloudflare API Token（至少 Zone / DNS / Edit 权限）。"
+        CF_API_TOKEN=$(read_secret "Cloudflare API Token（输入不会回显）")
+        if [ -z "$CF_API_TOKEN" ]; then
+            err "Cloudflare API Token 不能为空。"
+            return 1
+        fi
+        save_config
     fi
 }
 
@@ -190,6 +231,7 @@ install_dependencies() {
     ensure_package openssl openssl || return 1
     ensure_package openrc rc-service || return 1
     ensure_package jq jq || return 1
+    ensure_package dcron crond || return 1
     ensure_cloudflared || return 1
 }
 
@@ -281,6 +323,45 @@ target_host_only() {
     esac
 }
 
+ensure_crond() {
+    rc-update add crond default >/dev/null 2>&1 || true
+    rc-service crond start >/dev/null 2>&1 || true
+}
+
+random_acme_email() {
+    n=$(date +%s)
+    printf '%s@qq.com' "$n"
+}
+
+ensure_acme_ready() {
+    email="$1"
+    [ -n "$email" ] || email=$(random_acme_email)
+    if [ ! -x "$ACME_HOME/acme.sh" ]; then
+        say "安装 acme.sh..."
+        curl -fsSL https://get.acme.sh | sh -s email="$email" || return 1
+    fi
+    "$ACME_HOME/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+    "$ACME_HOME/acme.sh" --register-account -m "$email" --server letsencrypt >/dev/null 2>&1 || true
+    ensure_crond
+}
+
+issue_cloudflare_cert() {
+    domain="$1"
+    email="$2"
+    cert_dir="$CERT_HOME/$domain"
+    mkdir -p "$cert_dir"
+    ensure_acme_ready "$email" || return 1
+    export CF_Token="$CF_API_TOKEN"
+    say "申请证书：$domain"
+    "$ACME_HOME/acme.sh" --issue --dns dns_cf -d "$domain" --keylength ec-256 || return 1
+    "$ACME_HOME/acme.sh" --install-cert -d "$domain" --ecc \
+        --fullchain-file "$cert_dir/fullchain.cer" \
+        --key-file "$cert_dir/private.key" \
+        --reloadcmd "rc-service nginx reload || rc-service nginx restart || true" || return 1
+    chmod 600 "$cert_dir/private.key" 2>/dev/null || true
+    chmod 644 "$cert_dir/fullchain.cer" 2>/dev/null || true
+}
+
 validate_hostname() {
     host="$1"
     case "$host" in
@@ -289,6 +370,14 @@ validate_hostname() {
         *.*) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+validate_port() {
+    port="$1"
+    case "$port" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
 validate_nginx_value() {
@@ -314,6 +403,7 @@ save_site_env() {
     upstream_host="$4"
     custom_host="$5"
     service="$6"
+    listen_port="${7:-}"
     path=$(site_env_path "$hostname")
     tmp="$path.tmp"
     {
@@ -323,6 +413,7 @@ save_site_env() {
         printf 'UPSTREAM_HOST=%s\n' "$(shell_quote "$upstream_host")"
         printf 'CUSTOM_HOST=%s\n' "$(shell_quote "$custom_host")"
         printf 'SERVICE=%s\n' "$(shell_quote "$service")"
+        printf 'LISTEN_PORT=%s\n' "$(shell_quote "$listen_port")"
         printf 'NGINX_CONF=%s\n' "$(shell_quote "$(site_conf_path "$hostname")")"
     } > "$tmp"
     chmod 600 "$tmp"
@@ -335,17 +426,32 @@ render_site_nginx() {
     mode="$3"
     upstream_host="$4"
     custom_host="$5"
+    listen_port="${6:-}"
     conf=$(site_conf_path "$hostname")
     scheme=$(target_scheme "$target")
     host_only=$(target_host_only "$target")
     host_header="$upstream_host"
+    cert_dir="$CERT_HOME/$hostname"
     [ -n "$custom_host" ] && host_header="$custom_host"
 
     tmp="$conf.tmp"
     {
         printf 'server {\n'
-        printf '    listen 127.0.0.1:8080;\n'
+        if [ "$mode" = "public" ]; then
+            printf '    listen %s ssl;\n' "$listen_port"
+            printf '    listen [::]:%s ssl;\n' "$listen_port"
+        else
+            printf '    listen 127.0.0.1:8080;\n'
+        fi
         printf '    server_name %s;\n\n' "$hostname"
+        if [ "$mode" = "public" ]; then
+            printf '    ssl_certificate     %s/fullchain.cer;\n' "$cert_dir"
+            printf '    ssl_certificate_key %s/private.key;\n' "$cert_dir"
+            printf '    ssl_session_cache shared:SSL:10m;\n'
+            printf '    ssl_session_timeout 10m;\n'
+            printf '    ssl_protocols TLSv1.2 TLSv1.3;\n'
+            printf '    ssl_prefer_server_ciphers off;\n\n'
+        fi
         printf '    client_max_body_size 100m;\n'
         printf '    proxy_buffers 8 16k;\n'
         printf '    proxy_buffer_size 32k;\n'
@@ -374,16 +480,23 @@ render_site_nginx() {
         printf '        proxy_set_header Accept-Encoding "";\n\n'
         printf '        proxy_set_header Upgrade $http_upgrade;\n'
         printf '        proxy_set_header Connection $connection_upgrade;\n\n'
-        printf '        proxy_redirect %s://%s/ https://%s/;\n' "$scheme" "$upstream_host" "$hostname"
-        printf '        proxy_redirect https://%s/ https://%s/;\n' "$host_only" "$hostname"
-        printf '        proxy_redirect http://%s/ https://%s/;\n\n' "$host_only" "$hostname"
+        if [ "$mode" = "public" ]; then
+            redirect_base="https://$hostname:$listen_port"
+        else
+            redirect_base="https://$hostname"
+        fi
+        printf '        proxy_redirect %s://%s/ %s/;\n' "$scheme" "$upstream_host" "$redirect_base"
+        printf '        proxy_redirect https://%s/ %s/;\n' "$host_only" "$redirect_base"
+        printf '        proxy_redirect http://%s/ %s/;\n\n' "$host_only" "$redirect_base"
         printf '        proxy_cookie_domain %s %s;\n' "$host_only" "$hostname"
         printf '        proxy_cookie_domain .%s .%s;\n' "$host_only" "$hostname"
         printf '        proxy_cookie_domain %s %s;\n' "$upstream_host" "$hostname"
         printf '        proxy_cookie_path / /;\n'
-        if [ "$mode" = "cfcdn" ]; then
+        if [ "$mode" = "cfcdn" ] || [ "$mode" = "public" ]; then
             printf '\n'
-            printf '        proxy_ssl_verify off;\n'
+            if [ "$mode" = "cfcdn" ]; then
+                printf '        proxy_ssl_verify off;\n'
+            fi
             printf '        proxy_buffering off;\n'
             printf '        proxy_request_buffering off;\n'
         fi
@@ -430,7 +543,7 @@ has_nginx_site() {
         # shellcheck disable=SC1090
         . "$f"
         case "$MODE" in
-            proxy|mirror|cfcdn) return 0 ;;
+            proxy|mirror|cfcdn|public) return 0 ;;
         esac
     done
     return 1
@@ -497,10 +610,11 @@ managed_hostnames_json() {
     first=1
     for f in "$SITES_DIR"/*.env; do
         [ -f "$f" ] || continue
-        HOSTNAME= SERVICE=
+        HOSTNAME= MODE= SERVICE=
         # shellcheck disable=SC1090
         . "$f"
         [ -n "$HOSTNAME" ] || continue
+        [ "$MODE" != "public" ] || continue
         if [ "$first" = 1 ]; then
             first=0
         else
@@ -519,10 +633,11 @@ managed_ingress_json() {
     first=1
     for f in "$SITES_DIR"/*.env; do
         [ -f "$f" ] || continue
-        HOSTNAME= SERVICE=
+        HOSTNAME= MODE= SERVICE=
         # shellcheck disable=SC1090
         . "$f"
         [ -n "$HOSTNAME" ] || continue
+        [ "$MODE" != "public" ] || continue
         if [ "$first" = 1 ]; then
             first=0
         else
@@ -553,11 +668,23 @@ cf_sync_ingress() {
     cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body" | jq -e '.success == true' >/dev/null
 }
 
+cf_remove_ingress_hostname() {
+    hostname="$1"
+    require_config || return 1
+    current=$(cf_get_tunnel_config) || return 1
+    body=$(printf '%s' "$current" | jq -c \
+        --arg hostname "$hostname" \
+        '{config:{ingress:((.result.config.ingress // []) | map(select((.hostname // "") != $hostname)) | map(select(.service != "http_status:404")) + [{service:"http_status:404"}])}}') || return 1
+    say "移除 Cloudflare Tunnel ingress：$hostname"
+    cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body" | jq -e '.success == true' >/dev/null
+}
+
 mode_choice_number() {
     case "$1" in
         proxy) printf '2' ;;
         mirror) printf '3' ;;
         cfcdn) printf '4' ;;
+        public) printf '5' ;;
         *) printf '1' ;;
     esac
 }
@@ -567,9 +694,10 @@ choose_mode() {
     default_choice=$(mode_choice_number "$default_mode")
     printf '%s\n' "请选择反代模式：" >/dev/tty
     printf '%s\n' "1) Cloudflare Tunnel 直连服务（推荐：本机端口、IP:PORT、自建面板、API）" >/dev/tty
-    printf '%s\n' "2) Nginx 普通反代（需要 Nginx 处理 Host/Cookie/跳转时用）" >/dev/tty
-    printf '%s\n' "3) Nginx 网站镜像反代（仅适合简单网页，会尝试替换页面里的目标域名）" >/dev/tty
-    printf '%s\n' "4) Nginx 代理 CF CDN 目标站（目标站本身套了 Cloudflare 时用）" >/dev/tty
+    printf '%s\n' "2) Nginx 普通反代（经过 Tunnel，需要 Nginx 处理 Host/Cookie/跳转时用）" >/dev/tty
+    printf '%s\n' "3) Nginx 网站镜像反代（经过 Tunnel，仅适合简单网页）" >/dev/tty
+    printf '%s\n' "4) Nginx 代理 CF CDN 目标站（经过 Tunnel，目标站本身套了 Cloudflare 时用）" >/dev/tty
+    printf '%s\n' "5) Nginx 公网入站反代（不使用 Cloudflare Tunnel，需要开放入站端口）" >/dev/tty
     printf '选择 [%s]: ' "$default_choice" >/dev/tty
     IFS= read -r choice </dev/tty
     [ -n "$choice" ] || choice="$default_choice"
@@ -577,6 +705,7 @@ choose_mode() {
         2) printf 'proxy' ;;
         3) printf 'mirror' ;;
         4) printf 'cfcdn' ;;
+        5) printf 'public' ;;
         *) printf 'direct' ;;
     esac
 }
@@ -595,7 +724,7 @@ choose_host_header() {
 }
 
 add_site() {
-    require_config || return 1
+    load_config
     ensure_dirs
     hostname=$(read_input "公网域名，例如 app.example.com" "")
     if ! validate_hostname "$hostname"; then
@@ -617,9 +746,12 @@ add_site() {
     mode=$(choose_mode direct)
     service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
     custom_host=""
+    listen_port=""
     if [ "$mode" = "direct" ]; then
         service="$target"
     elif [ "$mode" = "cfcdn" ]; then
+        custom_host="$upstream_host"
+    elif [ "$mode" = "public" ]; then
         custom_host="$upstream_host"
     else
         custom_host=$(choose_host_header "$upstream_host")
@@ -628,21 +760,39 @@ add_site() {
             return 1
         fi
     fi
+    if [ "$mode" = "public" ]; then
+        require_cf_api_token || return 1
+        listen_port=$(read_input "公网 HTTPS 入站监听端口，例如 2053 或 52443" "52443")
+        if ! validate_port "$listen_port"; then
+            err "监听端口不合法。"
+            return 1
+        fi
+        acme_email=$(read_input "ACME 账户邮箱（留空自动生成）" "")
+        issue_cloudflare_cert "$hostname" "$acme_email" || return 1
+        service=""
+    else
+        require_config || return 1
+    fi
 
     backup_managed_files
-    save_site_env "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service"
+    save_site_env "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port"
     if [ "$mode" = "direct" ]; then
         rm -f "$(site_conf_path "$hostname")"
     else
-        render_site_nginx "$hostname" "$target" "$mode" "$upstream_host" "$custom_host"
+        render_site_nginx "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port"
         if ! nginx_reload_safe; then
             err "Nginx 配置测试失败，请检查 $(site_conf_path "$hostname")。"
             return 1
         fi
     fi
-    cf_upsert_dns "$hostname" || return 1
-    cf_sync_ingress || return 1
-    say "新增完成：https://$hostname -> $target [$mode]"
+    if [ "$mode" = "public" ]; then
+        say "新增完成：https://$hostname:$listen_port -> $target [public]"
+        say "请确认域名已解析到本机公网 IP，且防火墙/安全组已放行 TCP $listen_port。"
+    else
+        cf_upsert_dns "$hostname" || return 1
+        cf_sync_ingress || return 1
+        say "新增完成：https://$hostname -> $target [$mode]"
+    fi
 }
 
 mode_label() {
@@ -651,6 +801,7 @@ mode_label() {
         proxy) printf 'Nginx普通反代' ;;
         mirror) printf 'Nginx镜像反代' ;;
         cfcdn) printf 'Nginx代理CF CDN站' ;;
+        public) printf 'Nginx公网入站反代' ;;
         *) printf '%s' "$1" ;;
     esac
 }
@@ -659,10 +810,14 @@ list_sites() {
     i=1
     for f in "$SITES_DIR"/*.env; do
         [ -f "$f" ] || continue
-        HOSTNAME= TARGET= MODE=
+        HOSTNAME= TARGET= MODE= LISTEN_PORT=
         # shellcheck disable=SC1090
         . "$f"
-        printf '%s) %s -> %s [%s]\n' "$i" "$HOSTNAME" "$TARGET" "$(mode_label "$MODE")"
+        if [ "$MODE" = "public" ] && [ -n "$LISTEN_PORT" ]; then
+            printf '%s) %s:%s -> %s [%s]\n' "$i" "$HOSTNAME" "$LISTEN_PORT" "$TARGET" "$(mode_label "$MODE")"
+        else
+            printf '%s) %s -> %s [%s]\n' "$i" "$HOSTNAME" "$TARGET" "$(mode_label "$MODE")"
+        fi
         i=$((i + 1))
     done
     [ "$i" -gt 1 ]
@@ -697,10 +852,10 @@ select_site_file() {
 }
 
 edit_site() {
-    require_config || return 1
+    load_config
     select_site_file || return 1
     f="$SELECTED_SITE_FILE"
-    HOSTNAME= TARGET= MODE= UPSTREAM_HOST= CUSTOM_HOST=
+    HOSTNAME= TARGET= MODE= UPSTREAM_HOST= CUSTOM_HOST= LISTEN_PORT=
     # shellcheck disable=SC1090
     . "$f"
     old_hostname="$HOSTNAME"
@@ -726,9 +881,12 @@ edit_site() {
     mode=$(choose_mode "${MODE:-direct}")
     service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
     custom_host=""
+    listen_port=""
     if [ "$mode" = "direct" ]; then
         service="$target"
     elif [ "$mode" = "cfcdn" ]; then
+        custom_host="$upstream_host"
+    elif [ "$mode" = "public" ]; then
         custom_host="$upstream_host"
     else
         custom_host=$(choose_host_header "$upstream_host")
@@ -737,36 +895,63 @@ edit_site() {
             return 1
         fi
     fi
+    if [ "$mode" = "public" ]; then
+        require_cf_api_token || return 1
+        listen_port=$(read_input "公网 HTTPS 入站监听端口，例如 2053 或 52443" "${LISTEN_PORT:-52443}")
+        if ! validate_port "$listen_port"; then
+            err "监听端口不合法。"
+            return 1
+        fi
+        if [ "$new_hostname" != "$old_hostname" ] || [ "$old_mode" != "public" ] || [ ! -s "$CERT_HOME/$new_hostname/fullchain.cer" ] || [ ! -s "$CERT_HOME/$new_hostname/private.key" ]; then
+            acme_email=$(read_input "ACME 账户邮箱（留空自动生成）" "")
+            issue_cloudflare_cert "$new_hostname" "$acme_email" || return 1
+        fi
+        service=""
+    else
+        require_config || return 1
+    fi
 
     backup_managed_files
     if [ "$new_hostname" != "$old_hostname" ]; then
         rm -f "$old_conf" "$f"
     fi
-    save_site_env "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service"
+    save_site_env "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port"
     if [ "$mode" = "direct" ]; then
         rm -f "$(site_conf_path "$new_hostname")"
-        if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ]; then
+        if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ] || [ "$old_mode" = "public" ]; then
             nginx_reload_safe || warn "旧 Nginx 站点配置已删除，但 Nginx reload 失败，请手动检查。"
         else
             reload_nginx_if_needed || warn "已有 Nginx 站点配置测试失败，请检查 Nginx 配置。"
         fi
     else
-        render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host"
+        render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port"
         if ! nginx_reload_safe; then
             err "Nginx 配置测试失败。"
             return 1
         fi
     fi
-    if [ "$new_hostname" != "$old_hostname" ]; then
-        cf_delete_dns "$old_hostname" || warn "删除旧 DNS 失败：$old_hostname"
+    if [ "$old_mode" != "public" ] && [ "$mode" != "public" ]; then
+        if [ "$new_hostname" != "$old_hostname" ]; then
+            cf_delete_dns "$old_hostname" || warn "删除旧 DNS 失败：$old_hostname"
+            cf_remove_ingress_hostname "$old_hostname" || warn "移除旧 Tunnel ingress 失败：$old_hostname"
+        fi
     fi
-    cf_upsert_dns "$new_hostname" || return 1
-    cf_sync_ingress || return 1
-    say "修改完成：https://$new_hostname -> $target [$mode]"
+    if [ "$mode" = "public" ]; then
+        if [ "$old_mode" != "public" ]; then
+            cf_delete_dns "$old_hostname" || warn "删除旧 DNS 失败：$old_hostname"
+            cf_remove_ingress_hostname "$old_hostname" || warn "移除旧 Tunnel ingress 失败：$old_hostname"
+        fi
+        say "修改完成：https://$new_hostname:$listen_port -> $target [public]"
+        say "请确认域名已解析到本机公网 IP，且防火墙/安全组已放行 TCP $listen_port。"
+    else
+        cf_upsert_dns "$new_hostname" || return 1
+        cf_sync_ingress || return 1
+        say "修改完成：https://$new_hostname -> $target [$mode]"
+    fi
 }
 
 delete_site() {
-    require_config || return 1
+    load_config
     select_site_file || return 1
     f="$SELECTED_SITE_FILE"
     HOSTNAME= TARGET= MODE=
@@ -774,10 +959,15 @@ delete_site() {
     . "$f"
     old_mode="$MODE"
     say "将删除：$HOSTNAME -> $TARGET"
-    confirm "确认删除该反代及 Cloudflare DNS/ingress？" || return 0
+    if [ "$old_mode" = "public" ]; then
+        confirm "确认删除该公网入站反代？证书文件会保留。" || return 0
+    else
+        require_config || return 1
+        confirm "确认删除该反代及 Cloudflare DNS/ingress？" || return 0
+    fi
     backup_managed_files
     rm -f "$(site_conf_path "$HOSTNAME")" "$f"
-    if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ]; then
+    if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ] || [ "$old_mode" = "public" ]; then
         if ! nginx_reload_safe; then
             err "删除后 Nginx 配置测试失败。备份位于 $BACKUP_DIR。"
             return 1
@@ -786,9 +976,44 @@ delete_site() {
         err "删除后 Nginx 配置测试失败。备份位于 $BACKUP_DIR。"
         return 1
     fi
-    cf_delete_dns "$HOSTNAME" || warn "删除 DNS 失败：$HOSTNAME"
-    cf_sync_ingress || warn "同步 Tunnel ingress 失败。"
-    say "删除完成：$HOSTNAME"
+    if [ "$old_mode" = "public" ]; then
+        say "删除完成：$HOSTNAME"
+    else
+        cf_delete_dns "$HOSTNAME" || warn "删除 DNS 失败：$HOSTNAME"
+        cf_remove_ingress_hostname "$HOSTNAME" || warn "移除 Tunnel ingress 失败：$HOSTNAME"
+        say "删除完成：$HOSTNAME"
+    fi
+}
+
+service_status_label() {
+    svc="$1"
+    cmd="${2:-$1}"
+    if ! has_cmd "$cmd"; then
+        ui_bad '未安装'
+        return 0
+    fi
+    if rc-service "$svc" status >/dev/null 2>&1; then
+        ui_ok '运行中'
+    else
+        ui_warn '已停止'
+    fi
+}
+
+site_count() {
+    count=0
+    for f in "$SITES_DIR"/*.env; do
+        [ -f "$f" ] || continue
+        count=$((count + 1))
+    done
+    printf '%s' "$count"
+}
+
+show_status_card() {
+    ui_section "服务状态"
+    printf '  nginx       : %b\n' "$(service_status_label nginx nginx)"
+    printf '  cloudflared : %b\n' "$(service_status_label cloudflared cloudflared)"
+    printf '  反代站点    : %s 个\n' "$(site_count)"
+    printf '\n'
 }
 
 service_action() {
@@ -809,16 +1034,60 @@ show_logs() {
     fi
 }
 
+uninstall_manager() {
+    ui_header "卸载 $APP_NAME"
+    ui_section "将删除"
+    printf '  - %s\n' "$CONFIG_DIR"
+    printf '  - %s*.conf\n' "$NGINX_PREFIX"
+    printf '  - %s\n' "$NGINX_MAP_FILE"
+    printf '  - %s\n' "$CLOUDFLARED_INIT"
+    printf '  - %s\n' "$CLOUDFLARED_LOG"
+    printf '  - /usr/local/bin/cf-nginx-manager\n'
+    printf '\n'
+    ui_section "不会删除"
+    printf '  - nginx / cloudflared 软件包\n'
+    printf '  - Cloudflare 后台已经存在的 DNS 记录\n'
+    printf '  - Cloudflare Tunnel 远端配置\n'
+    printf '  - %s 下的其他证书目录\n' "$CERT_HOME"
+    printf '\n'
+    confirm "确认卸载本机 $APP_NAME 管理文件？" || return 0
+    confirm "再次确认：继续删除这些本地文件？" || return 0
+
+    uninstall_backup="/root/${APP_NAME}-uninstall-backup-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$uninstall_backup/nginx" "$uninstall_backup/sites"
+    cp "$NGINX_MAP_FILE" "$uninstall_backup/nginx/" 2>/dev/null || true
+    cp "$NGINX_PREFIX"*.conf "$uninstall_backup/nginx/" 2>/dev/null || true
+    cp "$SITES_DIR"/*.env "$uninstall_backup/sites/" 2>/dev/null || true
+    cp "$CONFIG_ENV" "$uninstall_backup/" 2>/dev/null || true
+    rc-service cloudflared stop >/dev/null 2>&1 || true
+    rc-update del cloudflared default >/dev/null 2>&1 || true
+    rm -f "$NGINX_PREFIX"*.conf 2>/dev/null || true
+    rm -f "$NGINX_MAP_FILE" 2>/dev/null || true
+    rm -f "$CLOUDFLARED_INIT" 2>/dev/null || true
+    rm -f "$CLOUDFLARED_LOG" 2>/dev/null || true
+    rm -f /usr/local/bin/cf-nginx-manager 2>/dev/null || true
+    rm -rf "$CONFIG_DIR" 2>/dev/null || true
+    if has_cmd nginx; then
+        nginx -t >/dev/null 2>&1 && rc-service nginx reload >/dev/null 2>&1 || true
+    fi
+    say "卸载完成。"
+    say "卸载前备份：$uninstall_backup"
+}
+
 local_test_site() {
     hostname=$(read_input "要测试的 Host" "")
     [ -n "$hostname" ] || return 1
     site_file=$(site_env_path "$hostname")
     if [ -f "$site_file" ]; then
-        MODE= TARGET=
+        MODE= TARGET= LISTEN_PORT=
         # shellcheck disable=SC1090
         . "$site_file"
         if [ "$MODE" = "direct" ]; then
             curl -I "$TARGET"
+            return $?
+        fi
+        if [ "$MODE" = "public" ]; then
+            curl -k -I --resolve "$hostname:$LISTEN_PORT:127.0.0.1" "https://$hostname:$LISTEN_PORT/"
             return $?
         fi
     fi
@@ -827,23 +1096,28 @@ local_test_site() {
 
 manage_services() {
     while :; do
-        say ""
-        say "服务管理"
-        say "1) nginx start"
-        say "2) nginx stop"
-        say "3) nginx restart"
-        say "4) nginx reload"
-        say "5) nginx status"
-        say "6) nginx -t"
-        say "7) cloudflared start"
-        say "8) cloudflared stop"
-        say "9) cloudflared restart"
-        say "10) cloudflared status"
-        say "11) 查看 cloudflared 日志"
-        say "12) 查看 127.0.0.1:8080 监听"
-        say "13) 本地 Host 测试"
-        say "0) 返回"
-        printf '选择: ' >/dev/tty
+        ui_header "服务管理"
+        show_status_card
+        ui_section "Nginx"
+        ui_menu_item 1 "启动 nginx"
+        ui_menu_item 2 "停止 nginx"
+        ui_menu_item 3 "重启 nginx"
+        ui_menu_item 4 "重载 nginx"
+        ui_menu_item 5 "查看 nginx 状态"
+        ui_menu_item 6 "测试 nginx 配置"
+        printf '\n'
+        ui_section "Cloudflared"
+        ui_menu_item 7 "启动 cloudflared"
+        ui_menu_item 8 "停止 cloudflared"
+        ui_menu_item 9 "重启 cloudflared"
+        ui_menu_item 10 "查看 cloudflared 状态"
+        ui_menu_item 11 "查看 cloudflared 日志"
+        printf '\n'
+        ui_section "诊断"
+        ui_menu_item 12 "查看 Nginx 监听端口"
+        ui_menu_item 13 "本地 Host 测试"
+        ui_back_item 0 "返回主菜单"
+        ui_prompt
         IFS= read -r c </dev/tty
         case "$c" in
             1) service_action nginx start ;;
@@ -857,7 +1131,7 @@ manage_services() {
             9) service_action cloudflared restart ;;
             10) service_action cloudflared status ;;
             11) show_logs "$CLOUDFLARED_LOG" ;;
-            12) ss -tlnp | grep ':8080' || true ;;
+            12) ss -tlnp | grep nginx || true ;;
             13) local_test_site ;;
             0) return 0 ;;
             *) warn "无效选择。" ;;
@@ -868,22 +1142,23 @@ manage_services() {
 
 site_menu() {
     while :; do
-        say ""
-        say "反代管理"
-        say "1) 新增反代"
-        say "2) 修改反代"
-        say "3) 删除反代"
-        say "4) 查看反代列表"
-        say "5) 同步 Cloudflare Tunnel ingress"
-        say "0) 返回"
-        printf '选择: ' >/dev/tty
+        ui_header "反代管理"
+        show_status_card
+        ui_section "站点操作"
+        ui_menu_item 1 "修改反代"
+        ui_menu_item 2 "删除反代"
+        ui_menu_item 3 "查看反代列表"
+        printf '\n'
+        ui_section "Cloudflare"
+        ui_menu_item 4 "同步 Cloudflare Tunnel ingress"
+        ui_back_item 0 "返回主菜单"
+        ui_prompt
         IFS= read -r c </dev/tty
         case "$c" in
-            1) add_site ;;
-            2) edit_site ;;
-            3) delete_site ;;
-            4) list_sites || true ;;
-            5) cf_sync_ingress ;;
+            1) edit_site ;;
+            2) delete_site ;;
+            3) list_sites || true ;;
+            4) cf_sync_ingress ;;
             0) return 0 ;;
             *) warn "无效选择。" ;;
         esac
@@ -896,22 +1171,29 @@ main_menu() {
     ensure_dirs
     load_config
     while :; do
-        say ""
-        say "$APP_NAME"
-        say "1) 首次初始化 / 修复环境"
-        say "2) 配置 Cloudflare 凭据"
-        say "3) 反代管理"
-        say "4) 服务管理"
-        say "5) 查看当前配置"
-        say "0) 退出"
-        printf '选择: ' >/dev/tty
+        ui_header "$APP_NAME"
+        show_status_card
+        ui_section "常用操作"
+        ui_menu_item 1 "首次初始化 / 修复环境"
+        ui_menu_item 2 "新增反代"
+        ui_menu_item 3 "反代管理"
+        printf '\n'
+        ui_section "系统维护"
+        ui_menu_item 4 "服务管理"
+        ui_menu_item 5 "配置 Cloudflare 凭据"
+        ui_menu_item 6 "查看当前配置"
+        ui_menu_item 7 "卸载本脚本"
+        ui_back_item 0 "退出"
+        ui_prompt
         IFS= read -r c </dev/tty
         case "$c" in
             1) init_environment ;;
-            2) configure_credentials ;;
+            2) add_site ;;
             3) site_menu ;;
             4) manage_services ;;
-            5) show_current_config ;;
+            5) configure_credentials ;;
+            6) show_current_config ;;
+            7) uninstall_manager ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
         esac
@@ -939,5 +1221,6 @@ case "${1:-}" in
     sync) cf_sync_ingress ;;
     services) manage_services ;;
     config) configure_credentials ;;
+    uninstall) uninstall_manager ;;
     *) main_menu ;;
 esac

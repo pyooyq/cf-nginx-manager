@@ -62,6 +62,7 @@ Nginx 反代模式：
 - 查看反代列表。
 - 自动创建 Cloudflare DNS CNAME。
 - 自动更新 Cloudflare Tunnel Public Hostname。
+- 也可以创建不走 Tunnel 的公网 HTTPS 入站反代。
 - 启动、停止、重启 `nginx` 和 `cloudflared`。
 
 ## 一键运行
@@ -152,6 +153,8 @@ My Profile -> API Tokens -> Create Token
 Account / Cloudflare Tunnel / Edit
 Zone / DNS / Edit
 ```
+
+如果你只用「Nginx 公网入站反代」模式，不需要管理 Tunnel，但申请证书仍然需要 `Zone / DNS / Edit`，因为脚本会用 DNS 验证申请 Let's Encrypt 证书。
 
 资源范围建议只选你的账号和你的域名，不要给全局权限。
 
@@ -281,15 +284,54 @@ https://target.example.com
 
 如果目标站启用了 Cloudflare 的 Bot Fight Mode、WAF、强风控、Turnstile 或严格登录校验，这个模式也不保证一定能过。
 
+### Nginx 公网入站反代（不使用 Tunnel）
+
+适合你的 VPS 有公网入站端口，想直接用 Nginx 提供 HTTPS 入口的情况。
+
+这个模式会：
+
+- 不使用 Cloudflare Tunnel。
+- 让 Nginx 直接监听你输入的 HTTPS 端口，例如 `52443`。
+- 用 acme.sh 通过 Cloudflare DNS 验证申请 Let's Encrypt 证书。
+- 把证书安装到 `/etc/nginx/certs/<域名>/`。
+- 通过 cron 自动续签，续签后自动 reload Nginx。
+
+使用前你需要自己确认：
+
+- 域名已经解析到这台 VPS 的公网 IP。
+- VPS 防火墙和服务商安全组已经放行你输入的 TCP 端口。
+- Cloudflare API Token 至少有 `Zone / DNS / Edit` 权限。
+- 如果 DNS 开了 Cloudflare 橙云代理，端口要选 Cloudflare 支持的 HTTPS 端口；如果是灰云 DNS only，端口由你的 VPS 防火墙决定。
+
+访问地址会带端口，例如：
+
+```text
+https://app.example.com:52443
+```
+
 ## 常用菜单
 
 ```text
-1) 首次初始化 / 修复环境
-2) 配置 Cloudflare 凭据
-3) 反代管理
-4) 服务管理
-5) 查看当前配置
-0) 退出
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  cf-nginx-manager
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+服务状态
+  nginx       : 运行中 / 已停止 / 未安装
+  cloudflared : 运行中 / 已停止 / 未安装
+  反代站点    : N 个
+
+常用操作
+   1) 首次初始化 / 修复环境
+   2) 新增反代
+   3) 反代管理
+
+系统维护
+   4) 服务管理
+   5) 配置 Cloudflare 凭据
+   6) 查看当前配置
+   7) 卸载本脚本
+   0) 退出
 ```
 
 服务管理里可以：
@@ -309,7 +351,7 @@ https://target.example.com
 nginx -t
 rc-service nginx status
 rc-service cloudflared status
-ss -tlnp | grep ':8080'
+ss -tlnp | grep nginx
 tail -n 100 /var/log/cloudflared.log
 ```
 
@@ -323,6 +365,12 @@ curl -I -H 'Host: app.example.com' http://127.0.0.1:8080/
 
 ```sh
 curl -I https://app.example.com/
+```
+
+如果是「Nginx 公网入站反代」模式，带上你设置的端口：
+
+```sh
+curl -I https://app.example.com:52443/
 ```
 
 ## 安全说明
@@ -348,17 +396,36 @@ curl -I https://app.example.com/
 
 ## 卸载
 
-如果你不想用了，可以手动删除：
+推荐从主菜单选择：
+
+```text
+7) 卸载本脚本
+```
+
+或者直接运行：
 
 ```sh
-rc-service cloudflared stop
-rc-service nginx reload
-rc-update del cloudflared default
-rm -rf /etc/cf-nginx-manager
-rm -f /etc/nginx/http.d/cf-nginx-manager-*.conf
-rm -f /etc/nginx/http.d/00-cf-nginx-manager-map.conf
-rm -f /etc/init.d/cloudflared
-nginx -t && rc-service nginx reload
+cf-nginx-manager uninstall
 ```
+
+卸载前会把本脚本管理的配置备份到 `/root/cf-nginx-manager-uninstall-backup-*`。
+
+卸载会删除本脚本管理的本地文件：
+
+```text
+/etc/cf-nginx-manager/
+/etc/nginx/http.d/cf-nginx-manager-*.conf
+/etc/nginx/http.d/00-cf-nginx-manager-map.conf
+/etc/init.d/cloudflared
+/var/log/cloudflared.log
+/usr/local/bin/cf-nginx-manager
+```
+
+卸载不会自动删除：
+
+- `nginx` / `cloudflared` 软件包。
+- Cloudflare 后台已经创建的 DNS 记录。
+- Cloudflare Tunnel 远端 Public Hostname / ingress。
+- `/etc/nginx/certs/` 里的其他证书目录。
 
 Cloudflare 上已经创建的 DNS 和 Tunnel Public Hostname，建议先用脚本删除反代，再卸载。否则需要到 Cloudflare 后台手动删除。
