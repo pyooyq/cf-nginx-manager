@@ -653,7 +653,7 @@ site_file_by_number() {
     for f in "$SITES_DIR"/*.env; do
         [ -f "$f" ] || continue
         if [ "$i" = "$wanted" ]; then
-            printf '%s' "$f"
+            SELECTED_SITE_FILE="$f"
             return 0
         fi
         i=$((i + 1))
@@ -662,18 +662,23 @@ site_file_by_number() {
 }
 
 select_site_file() {
+    SELECTED_SITE_FILE=""
     if ! list_sites >/dev/tty; then
         err "当前没有站点。"
         return 1
     fi
     printf '选择站点编号: ' >/dev/tty
     IFS= read -r n </dev/tty
-    site_file_by_number "$n"
+    if ! site_file_by_number "$n"; then
+        err "无效的站点编号。"
+        return 1
+    fi
 }
 
 edit_site() {
     require_config || return 1
-    f=$(select_site_file) || return 1
+    select_site_file || return 1
+    f="$SELECTED_SITE_FILE"
     HOSTNAME= TARGET= MODE= UPSTREAM_HOST= CUSTOM_HOST=
     # shellcheck disable=SC1090
     . "$f"
@@ -739,7 +744,8 @@ edit_site() {
 
 delete_site() {
     require_config || return 1
-    f=$(select_site_file) || return 1
+    select_site_file || return 1
+    f="$SELECTED_SITE_FILE"
     HOSTNAME= TARGET= MODE=
     # shellcheck disable=SC1090
     . "$f"
