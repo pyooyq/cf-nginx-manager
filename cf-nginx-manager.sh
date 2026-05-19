@@ -28,9 +28,9 @@ read_input() {
     prompt="$1"
     default="$2"
     if [ -n "$default" ]; then
-        printf '%s [%s]: ' "$prompt" "$default"
+        printf '%s [%s]: ' "$prompt" "$default" >/dev/tty
     else
-        printf '%s: ' "$prompt"
+        printf '%s: ' "$prompt" >/dev/tty
     fi
     read -r value
     if [ -z "$value" ]; then
@@ -41,11 +41,11 @@ read_input() {
 
 read_secret() {
     prompt="$1"
-    printf '%s: ' "$prompt"
+    printf '%s: ' "$prompt" >/dev/tty
     stty -echo 2>/dev/null || true
     read -r value
     stty echo 2>/dev/null || true
-    printf '\n'
+    printf '\n' >/dev/tty
     printf '%s' "$value"
 }
 
@@ -515,10 +515,10 @@ cf_sync_ingress() {
 }
 
 choose_mode() {
-    say "请选择反代模式："
-    say "1) 普通反代（跳转/Cookie 改写）"
-    say "2) 镜像反代（额外替换响应体域名）"
-    printf '选择 [2]: '
+    printf '%s\n' "请选择反代模式：" >/dev/tty
+    printf '%s\n' "1) 普通反代（跳转/Cookie 改写）" >/dev/tty
+    printf '%s\n' "2) 镜像反代（额外替换响应体域名）" >/dev/tty
+    printf '选择 [2]: ' >/dev/tty
     read -r choice
     case "$choice" in
         1) printf 'proxy' ;;
@@ -528,10 +528,10 @@ choose_mode() {
 
 choose_host_header() {
     upstream_host="$1"
-    say "Host 头策略："
-    say "1) 使用上游 Host：$upstream_host（推荐）"
-    say "2) 自定义 Host"
-    printf '选择 [1]: '
+    printf '%s\n' "Host 头策略：" >/dev/tty
+    printf '%s\n' "1) 使用上游 Host：$upstream_host（推荐）" >/dev/tty
+    printf '%s\n' "2) 自定义 Host" >/dev/tty
+    printf '选择 [1]: ' >/dev/tty
     read -r choice
     case "$choice" in
         2) read_input "自定义 Host" "$upstream_host" ;;
