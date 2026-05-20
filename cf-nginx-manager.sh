@@ -568,7 +568,13 @@ issue_cloudflare_cert() {
     export CF_Zone_ID="$CF_ZONE_ID"
     export CF_Account_ID="$CF_ACCOUNT_ID"
     say "申请证书：$domain"
-    "$ACME_HOME/acme.sh" --issue --dns dns_cf -d "$domain" --keylength ec-256 || return 1
+    if ! "$ACME_HOME/acme.sh" --issue --dns dns_cf -d "$domain" --keylength ec-256; then
+        if "$ACME_HOME/acme.sh" --list 2>/dev/null | awk -v d="$domain" '$1 == d { found=1 } END { exit found ? 0 : 1 }'; then
+            warn "证书已存在且未到续签时间，继续安装现有证书。"
+        else
+            return 1
+        fi
+    fi
     "$ACME_HOME/acme.sh" --install-cert -d "$domain" --ecc \
         --fullchain-file "$cert_dir/fullchain.cer" \
         --key-file "$cert_dir/private.key" \
