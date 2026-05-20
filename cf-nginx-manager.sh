@@ -492,7 +492,8 @@ render_site_nginx() {
         else
             printf '        set $proxy_request_uri "$request_uri";\n'
         fi
-        printf '        proxy_pass %s://%s$proxy_request_uri;\n' "$scheme" "$upstream_host"
+        printf '        set $proxy_upstream "%s://%s";\n' "$scheme" "$upstream_host"
+        printf '        proxy_pass $proxy_upstream$proxy_request_uri;\n'
         printf '        proxy_http_version 1.1;\n\n'
         if [ "$scheme" = "https" ]; then
             printf '        proxy_ssl_server_name on;\n'
