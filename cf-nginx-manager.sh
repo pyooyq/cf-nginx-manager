@@ -1576,8 +1576,8 @@ main_menu() {
         case "$c" in
             1) init_environment ;;
             2) add_site ;;
-            3) site_menu ;;
-            4) manage_services ;;
+            3) site_menu; continue ;;
+            4) manage_services; continue ;;
             5) configure_credentials ;;
             6) show_current_config ;;
             7) self_update ;;
