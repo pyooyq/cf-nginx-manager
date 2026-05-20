@@ -382,12 +382,8 @@ ensure_cloudflared() {
         return 0
     fi
 
-    if ! grep -q '^http://dl-cdn.alpinelinux.org/alpine/edge/testing' /etc/apk/repositories 2>/dev/null; then
-        say "追加 edge/testing 仓库以安装 cloudflared。"
-        printf '%s\n' 'http://dl-cdn.alpinelinux.org/alpine/edge/testing' >> /etc/apk/repositories
-    fi
-
-    apk update && apk add --no-cache cloudflared
+    say "临时使用 edge/testing 仓库安装 cloudflared。"
+    apk add --no-cache --repository http://dl-cdn.alpinelinux.org/alpine/edge/testing cloudflared
 }
 
 install_dependencies() {
@@ -414,11 +410,13 @@ render_cloudflared_openrc() {
 
 name="cloudflared"
 description="Cloudflare Tunnel"
+supervisor="supervise-daemon"
 command="/usr/bin/cloudflared"
-command_background=true
 pidfile="/run/cloudflared.pid"
 output_log="/var/log/cloudflared.log"
 error_log="/var/log/cloudflared.log"
+respawn_delay=5
+respawn_max=0
 
 start_pre() {
     if [ -f /etc/cf-nginx-manager/config.env ]; then
@@ -551,7 +549,19 @@ ensure_acme_ready() {
     [ -n "$email" ] || email=$(random_acme_email)
     if [ ! -x "$ACME_HOME/acme.sh" ]; then
         say "安装 acme.sh..."
-        curl -fsSL https://get.acme.sh | sh -s email="$email" || return 1
+        tmp=$(mktemp)
+        if ! curl -fsSL https://get.acme.sh -o "$tmp"; then
+            rm -f "$tmp"
+            return 1
+        fi
+        if ! sh -n "$tmp"; then
+            rm -f "$tmp"
+            return 1
+        fi
+        sh "$tmp" email="$email"
+        rc=$?
+        rm -f "$tmp"
+        [ "$rc" -eq 0 ] || return 1
     fi
     "$ACME_HOME/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
     "$ACME_HOME/acme.sh" --register-account -m "$email" --server letsencrypt >/dev/null 2>&1 || true
@@ -631,14 +641,30 @@ validate_ipv4() {
 
 validate_ipv6() {
     ip="$1"
-    case "$ip" in
-        *:*) ;;
-        *) return 1 ;;
-    esac
-    case "$ip" in
-        ''|*[!0-9A-Fa-f:.]*) return 1 ;;
-        *) return 0 ;;
-    esac
+    printf '%s\n' "$ip" | awk '
+        function hex(s) { return s != "" && length(s) <= 4 && s !~ /[^0-9A-Fa-f]/ }
+        {
+            ip = $0
+            if (ip == "" || ip !~ /:/ || ip ~ /[^0-9A-Fa-f:]/ || ip ~ /:::/) exit 1
+            tmp = ip
+            double_colon = gsub(/::/, "", tmp)
+            if (double_colon > 1) exit 1
+            n = split(ip, part, ":")
+            nonempty = 0
+            empty = 0
+            for (i = 1; i <= n; i++) {
+                if (part[i] == "") {
+                    empty++
+                } else {
+                    if (!hex(part[i])) exit 1
+                    nonempty++
+                }
+            }
+            if (double_colon == 1 && nonempty < 8) exit 0
+            if (double_colon == 0 && empty == 0 && nonempty == 8) exit 0
+            exit 1
+        }
+    '
 }
 
 cloudflare_https_port_supported() {
@@ -682,6 +708,9 @@ save_site_env() {
     custom_host="$5"
     service="$6"
     listen_port="${7:-}"
+    public_dns_proxied="${8:-}"
+    public_ipv4="${9:-}"
+    public_ipv6="${10:-}"
     path=$(site_env_path "$hostname")
     tmp="$path.tmp"
     {
@@ -692,6 +721,9 @@ save_site_env() {
         printf 'CUSTOM_HOST=%s\n' "$(shell_quote "$custom_host")"
         printf 'SERVICE=%s\n' "$(shell_quote "$service")"
         printf 'LISTEN_PORT=%s\n' "$(shell_quote "$listen_port")"
+        printf 'PUBLIC_DNS_PROXIED=%s\n' "$(shell_quote "$public_dns_proxied")"
+        printf 'PUBLIC_IPV4=%s\n' "$(shell_quote "$public_ipv4")"
+        printf 'PUBLIC_IPV6=%s\n' "$(shell_quote "$public_ipv6")"
         printf 'NGINX_CONF=%s\n' "$(shell_quote "$(site_conf_path "$hostname")")"
     } > "$tmp"
     chmod 600 "$tmp"
@@ -726,8 +758,8 @@ render_site_nginx() {
                 public_redirect_base="https://$hostname:$listen_port"
             fi
             printf 'server {\n'
-            printf '    listen %s;\n' "$listen_port"
-            printf '    listen [::]:%s;\n' "$listen_port"
+            printf '    listen 80;\n'
+            printf '    listen [::]:80;\n'
             printf '    server_name %s;\n\n' "$hostname"
             printf '    return 301 %s$request_uri;\n' "$public_redirect_base"
             printf '}\n\n'
@@ -790,7 +822,11 @@ render_site_nginx() {
         printf '        proxy_set_header Upgrade $http_upgrade;\n'
         printf '        proxy_set_header Connection $connection_upgrade;\n\n'
         if [ "$mode" = "public" ]; then
-            redirect_base="https://$hostname:$listen_port"
+            if [ "$listen_port" = "443" ]; then
+                redirect_base="https://$hostname"
+            else
+                redirect_base="https://$hostname:$listen_port"
+            fi
         else
             redirect_base="https://$hostname"
         fi
@@ -826,13 +862,28 @@ render_site_nginx() {
     mv "$tmp" "$conf"
 }
 
+copy_existing_files() {
+    dst="$1"
+    shift
+    for f do
+        [ -f "$f" ] || continue
+        cp "$f" "$dst/" 2>/dev/null || true
+    done
+}
+
+remove_existing_files() {
+    for f do
+        [ -e "$f" ] || continue
+        rm -f "$f" 2>/dev/null || true
+    done
+}
+
 backup_managed_files() {
     ts=$(date +%Y%m%d-%H%M%S)
     dst="$BACKUP_DIR/$ts"
     mkdir -p "$dst/nginx" "$dst/sites"
-    cp "$NGINX_MAP_FILE" "$dst/nginx/" 2>/dev/null || true
-    cp "$NGINX_PREFIX"*.conf "$dst/nginx/" 2>/dev/null || true
-    cp "$SITES_DIR"/*.env "$dst/sites/" 2>/dev/null || true
+    copy_existing_files "$dst/nginx" "$NGINX_MAP_FILE" "$NGINX_PREFIX"*.conf
+    copy_existing_files "$dst/sites" "$SITES_DIR"/*.env
 }
 
 nginx_reload_safe() {
@@ -893,8 +944,7 @@ cf_api_success() {
     if [ -n "$messages" ]; then
         printf '%s\n' "$messages" >&2
     elif [ -n "$response" ]; then
-        printf '%s\n' "$response" | head -c 500 >&2
-        printf '\n' >&2
+        printf '%.500s\n' "$response" >&2
     else
         err "Cloudflare API 未返回响应。"
     fi
@@ -1126,7 +1176,7 @@ sync_managed_dns() {
         # shellcheck disable=SC1090
         . "$f"
         [ -n "$HOSTNAME" ] || continue
-        [ "$MODE" != "public" ] || continue
+        [ "$MODE" = "public" ] && continue
         cf_upsert_dns "$HOSTNAME" || return 1
     done
 }
@@ -1141,7 +1191,7 @@ managed_hostnames_json() {
         # shellcheck disable=SC1090
         . "$f"
         [ -n "$HOSTNAME" ] || continue
-        [ "$MODE" != "public" ] || continue
+        [ "$MODE" = "public" ] && continue
         if [ "$first" = 1 ]; then
             first=0
         else
@@ -1164,7 +1214,7 @@ managed_ingress_json() {
         # shellcheck disable=SC1090
         . "$f"
         [ -n "$HOSTNAME" ] || continue
-        [ "$MODE" != "public" ] || continue
+        [ "$MODE" = "public" ] && continue
         if [ "$first" = 1 ]; then
             first=0
         else
@@ -1313,8 +1363,8 @@ add_site() {
     if [ "$mode" = "public" ]; then
         require_cf_api_token || return 1
         listen_port=$(read_input "公网 HTTPS 入站监听端口，例如 2053 或 52443" "52443")
-        if ! validate_port "$listen_port"; then
-            err "监听端口不合法。"
+        if ! validate_port "$listen_port" || [ "$listen_port" = "80" ]; then
+            err "HTTPS 监听端口不合法，且不能使用 80。"
             return 1
         fi
         choose_public_dns_settings "$listen_port" || return 1
@@ -1466,8 +1516,8 @@ edit_site() {
     if [ "$mode" = "public" ]; then
         require_cf_api_token || return 1
         listen_port=$(read_input "公网 HTTPS 入站监听端口，例如 2053 或 52443" "${LISTEN_PORT:-52443}")
-        if ! validate_port "$listen_port"; then
-            err "监听端口不合法。"
+        if ! validate_port "$listen_port" || [ "$listen_port" = "80" ]; then
+            err "HTTPS 监听端口不合法，且不能使用 80。"
             return 1
         fi
         choose_public_dns_settings "$listen_port" "${PUBLIC_DNS_PROXIED:-0}" "${PUBLIC_IPV4:-}" "${PUBLIC_IPV6:-}" || return 1
@@ -1608,18 +1658,19 @@ delete_site() {
     say "删除完成：$HOSTNAME"
 }
 
-service_status_label() {
-    svc="$1"
-    cmd="${2:-$1}"
+print_service_status_line() {
+    label="$1"
+    svc="$2"
+    cmd="${3:-$2}"
+    printf '  %-12s: ' "$label"
     if ! has_cmd "$cmd"; then
         ui_bad '未安装'
-        return 0
-    fi
-    if rc-service "$svc" status >/dev/null 2>&1; then
+    elif rc-service "$svc" status >/dev/null 2>&1; then
         ui_ok '运行中'
     else
         ui_warn '已停止'
     fi
+    printf '\n'
 }
 
 site_count() {
@@ -1633,9 +1684,9 @@ site_count() {
 
 show_status_card() {
     ui_section "服务状态"
-    printf '  nginx       : %b\n' "$(service_status_label nginx nginx)"
-    printf '  cloudflared : %b\n' "$(service_status_label cloudflared cloudflared)"
-    printf '  反代站点    : %s 个\n' "$(site_count)"
+    print_service_status_line nginx nginx nginx
+    print_service_status_line cloudflared cloudflared cloudflared
+    printf '  %-12s: %s 个\n' "反代站点" "$(site_count)"
     printf '\n'
 }
 
@@ -1680,18 +1731,12 @@ uninstall_manager() {
 
     uninstall_backup="/root/${APP_NAME}-uninstall-backup-$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$uninstall_backup/nginx" "$uninstall_backup/sites"
-    cp "$NGINX_MAP_FILE" "$uninstall_backup/nginx/" 2>/dev/null || true
-    cp "$NGINX_PREFIX"*.conf "$uninstall_backup/nginx/" 2>/dev/null || true
-    cp "$SITES_DIR"/*.env "$uninstall_backup/sites/" 2>/dev/null || true
-    cp "$CONFIG_ENV" "$uninstall_backup/" 2>/dev/null || true
+    copy_existing_files "$uninstall_backup/nginx" "$NGINX_MAP_FILE" "$NGINX_PREFIX"*.conf
+    copy_existing_files "$uninstall_backup/sites" "$SITES_DIR"/*.env
+    copy_existing_files "$uninstall_backup" "$CONFIG_ENV"
     rc-service cloudflared stop >/dev/null 2>&1 || true
     rc-update del cloudflared default >/dev/null 2>&1 || true
-    rm -f "$NGINX_PREFIX"*.conf 2>/dev/null || true
-    rm -f "$NGINX_MAP_FILE" 2>/dev/null || true
-    rm -f "$CLOUDFLARED_INIT" 2>/dev/null || true
-    rm -f "$CLOUDFLARED_LOG" 2>/dev/null || true
-    rm -f "$INSTALL_BIN" 2>/dev/null || true
-    rm -f "$LEGACY_BIN" 2>/dev/null || true
+    remove_existing_files "$NGINX_PREFIX"*.conf "$NGINX_MAP_FILE" "$CLOUDFLARED_INIT" "$CLOUDFLARED_LOG" "$INSTALL_BIN" "$LEGACY_BIN"
     rm -rf "$CONFIG_DIR" 2>/dev/null || true
     if has_cmd nginx; then
         nginx -t >/dev/null 2>&1 && rc-service nginx reload >/dev/null 2>&1 || true
