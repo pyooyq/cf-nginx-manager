@@ -87,6 +87,16 @@ confirm_default_no() {
     esac
 }
 
+confirm_default_yes() {
+    prompt="$1"
+    printf '%s [Y/n]: ' "$prompt" >/dev/tty
+    IFS= read -r answer </dev/tty
+    case "$answer" in
+        n|N|no|NO) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 confirm() {
     confirm_default_no "$1"
 }
@@ -147,44 +157,63 @@ save_config() {
 
 cloudflare_tunnel_token() {
     tunnel_id="$1"
-    cf_api_request GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$tunnel_id/token" | jq -r '.result // empty'
+    response=$(cf_api_request GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$tunnel_id/token") || return 1
+    cf_api_success "$response" || return 1
+    printf '%s' "$response" | jq -r '.result // empty'
 }
 
-create_cloudflare_tunnel() {
-    if [ -n "${CF_TUNNEL_ID:-}" ] && [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
-        say "沿用已保存的 Cloudflare Tunnel：$CF_TUNNEL_ID"
-        return 0
-    fi
-    if [ -n "${CF_TUNNEL_ID:-}" ]; then
-        say "获取已保存 Tunnel 的 Token：$CF_TUNNEL_ID"
-        CF_TUNNEL_TOKEN=$(cloudflare_tunnel_token "$CF_TUNNEL_ID") || return 1
-        if [ -n "$CF_TUNNEL_TOKEN" ]; then
-            return 0
-        fi
-        warn "无法获取已保存 Tunnel 的 Token，将创建新的 Tunnel。"
-        CF_TUNNEL_ID=""
-    fi
-
+create_new_cloudflare_tunnel() {
     default_name="$APP_NAME-$(hostname 2>/dev/null || date +%s)"
     tunnel_name=$(read_input "Cloudflare Tunnel 名称" "$default_name")
     [ -n "$tunnel_name" ] || tunnel_name="$default_name"
     body=$(jq -cn --arg name "$tunnel_name" '{name:$name,config_src:"cloudflare"}')
     say "创建 Cloudflare Tunnel：$tunnel_name"
     result=$(cf_api_request POST "/accounts/$CF_ACCOUNT_ID/cfd_tunnel" "$body") || return 1
-    CF_TUNNEL_ID=$(printf '%s' "$result" | jq -r '.result.id // empty')
-    if [ -z "$CF_TUNNEL_ID" ]; then
+    cf_api_success "$result" || return 1
+    new_tunnel_id=$(printf '%s' "$result" | jq -r '.result.id // empty')
+    if [ -z "$new_tunnel_id" ]; then
         err "创建 Tunnel 失败，未返回 Tunnel ID。"
         return 1
     fi
-    CF_TUNNEL_TOKEN=$(cloudflare_tunnel_token "$CF_TUNNEL_ID") || return 1
-    if [ -z "$CF_TUNNEL_TOKEN" ]; then
-        err "获取 Tunnel Token 失败。请确认 API Token 具有 Account / Cloudflare Tunnel / Edit 权限。"
+    new_tunnel_token=$(cloudflare_tunnel_token "$new_tunnel_id") || {
+        warn "Tunnel 已创建但获取 Token 失败：$new_tunnel_id。请到 Cloudflare 后台清理未使用的 Tunnel。"
+        return 1
+    }
+    if [ -z "$new_tunnel_token" ]; then
+        warn "Tunnel 已创建但未返回 Token：$new_tunnel_id。请到 Cloudflare 后台清理未使用的 Tunnel。"
         return 1
     fi
+    CF_TUNNEL_ID="$new_tunnel_id"
+    CF_TUNNEL_TOKEN="$new_tunnel_token"
     say "Tunnel 已创建：$CF_TUNNEL_ID"
 }
 
+configure_cloudflare_tunnel() {
+    if [ -n "${CF_TUNNEL_ID:-}" ]; then
+        say "当前已保存 Tunnel：$CF_TUNNEL_ID"
+        printf '%s\n' "1) 创建新的独立 Tunnel（推荐：每台 VPS 一个 Tunnel）" >/dev/tty
+        printf '%s\n' "2) 沿用当前 Tunnel" >/dev/tty
+        printf '选择 [1]: ' >/dev/tty
+        IFS= read -r choice </dev/tty
+        case "$choice" in
+            2)
+                if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
+                    say "获取当前 Tunnel Token：$CF_TUNNEL_ID"
+                    CF_TUNNEL_TOKEN=$(cloudflare_tunnel_token "$CF_TUNNEL_ID") || return 1
+                fi
+                [ -n "${CF_TUNNEL_TOKEN:-}" ] || { err "当前 Tunnel Token 为空。"; return 1; }
+                say "沿用已保存的 Cloudflare Tunnel：$CF_TUNNEL_ID"
+                return 0
+                ;;
+        esac
+        CF_TUNNEL_ID=""
+        CF_TUNNEL_TOKEN=""
+    fi
+    create_new_cloudflare_tunnel
+}
+
 configure_credentials() {
+    need_root
     load_config
     old_api_token="${CF_API_TOKEN:-}"
     say "请输入 Cloudflare API 信息。"
@@ -205,10 +234,17 @@ configure_credentials() {
         err "Account ID、Zone ID、API Token 都不能为空。"
         return 1
     fi
-    create_cloudflare_tunnel || return 1
+    if confirm_default_yes "是否配置 Cloudflare Tunnel？只使用公网入站反代可选否"; then
+        configure_cloudflare_tunnel || return 1
+    else
+        CF_TUNNEL_ID=""
+        CF_TUNNEL_TOKEN=""
+    fi
 
     save_config
-    render_cloudflared_openrc
+    if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
+        render_cloudflared_openrc
+    fi
     say "配置已保存到 $CONFIG_ENV。"
 }
 
@@ -324,6 +360,27 @@ map $http_upgrade $connection_upgrade {
 EOF
 }
 
+system_resolvers() {
+    resolvers=""
+    if [ -f /etc/resolv.conf ]; then
+        while IFS= read -r line; do
+            set -- $line
+            [ "${1:-}" = "nameserver" ] || continue
+            ns="${2:-}"
+            case "$ns" in
+                ''|\#*|0.0.0.0) continue ;;
+                *:*) ns="[$ns]" ;;
+            esac
+            resolvers="$resolvers $ns"
+        done < /etc/resolv.conf
+    fi
+    if [ -n "$resolvers" ]; then
+        printf '%s' "${resolvers# }"
+    else
+        printf '%s' '1.1.1.1 8.8.8.8'
+    fi
+}
+
 service_add_default() {
     svc="$1"
     rc-update add "$svc" default >/dev/null 2>&1 || true
@@ -334,14 +391,19 @@ init_environment() {
     ensure_dirs
     install_dependencies || return 1
     render_nginx_map
-    render_cloudflared_openrc
     service_add_default nginx
-    service_add_default cloudflared
     if [ ! -f "$CONFIG_ENV" ]; then
         configure_credentials || return 1
     fi
+    load_config
+    if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
+        render_cloudflared_openrc
+        service_add_default cloudflared
+    fi
     nginx -t && rc-service nginx restart
-    rc-service cloudflared restart || warn "cloudflared 启动失败，请检查 token 或日志：$CLOUDFLARED_LOG"
+    if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
+        rc-service cloudflared restart || warn "cloudflared 启动失败，请检查 token 或日志：$CLOUDFLARED_LOG"
+    fi
     say "初始化完成。"
 }
 
@@ -426,11 +488,23 @@ issue_cloudflare_cert() {
 validate_hostname() {
     host="$1"
     case "$host" in
-        ''|*' '*|*/*|*:*) return 1 ;;
-        *[!A-Za-z0-9._-]*) return 1 ;;
-        *.*) return 0 ;;
+        ''|*' '*|*/*|*:*|*_*|*..*|.*|*.) return 1 ;;
+        *[!A-Za-z0-9.-]*) return 1 ;;
+        *.*) ;;
         *) return 1 ;;
     esac
+    old_ifs=$IFS
+    IFS=.
+    set -- $host
+    IFS=$old_ifs
+    for label do
+        [ -n "$label" ] || return 1
+        [ "${#label}" -le 63 ] || return 1
+        case "$label" in
+            -*|*-) return 1 ;;
+        esac
+    done
+    [ "${#host}" -le 253 ]
 }
 
 validate_port() {
@@ -528,10 +602,11 @@ render_site_nginx() {
             printf '    ssl_protocols TLSv1.2 TLSv1.3;\n'
             printf '    ssl_prefer_server_ciphers off;\n\n'
         fi
+        resolvers=$(system_resolvers)
         if [ "$UPSTREAM_IPV6" = "1" ]; then
-            printf '    resolver 1.1.1.1 8.8.8.8 ipv6=on valid=300s;\n'
+            printf '    resolver %s valid=300s;\n' "$resolvers"
         else
-            printf '    resolver 1.1.1.1 8.8.8.8 ipv6=off valid=300s;\n'
+            printf '    resolver %s ipv6=off valid=300s;\n' "$resolvers"
         fi
         printf '    resolver_timeout 5s;\n\n'
         printf '    client_max_body_size 100m;\n'
@@ -652,15 +727,30 @@ cf_api_request() {
         return 1
     fi
     if [ -n "$body" ]; then
-        curl -fsS -X "$method" "$CF_API_BASE$path" \
+        curl -sS -X "$method" "$CF_API_BASE$path" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H 'Content-Type: application/json' \
             --data "$body"
     else
-        curl -fsS -X "$method" "$CF_API_BASE$path" \
+        curl -sS -X "$method" "$CF_API_BASE$path" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H 'Content-Type: application/json'
     fi
+}
+
+cf_api_success() {
+    response="$1"
+    if printf '%s' "$response" | jq -e '.success == true' >/dev/null 2>&1; then
+        return 0
+    fi
+    printf '%s' "$response" | jq -r '.errors[]?.message // empty' >&2
+    return 1
+}
+
+cf_api_result() {
+    response="$1"
+    cf_api_success "$response" || return 1
+    printf '%s' "$response" | jq -c '.result'
 }
 
 cf_api() {
@@ -671,23 +761,45 @@ cf_api() {
     cf_api_request "$method" "$path" "$body"
 }
 
+cf_dns_records() {
+    hostname="$1"
+    response=$(cf_api GET "/zones/$CF_ZONE_ID/dns_records?name=$hostname") || return 1
+    cf_api_success "$response" || return 1
+    printf '%s' "$response"
+}
+
 cf_dns_record_id() {
     hostname="$1"
-    cf_api GET "/zones/$CF_ZONE_ID/dns_records?type=CNAME&name=$hostname" | jq -r '.result[0].id // empty'
+    response=$(cf_dns_records "$hostname") || return 1
+    printf '%s' "$response" | jq -r '.result[]? | select(.type == "CNAME") | .id' | head -n 1
+}
+
+cf_dns_conflicts() {
+    hostname="$1"
+    target="$2"
+    response=$(cf_dns_records "$hostname") || return 1
+    printf '%s' "$response" | jq -r --arg target "$target" '.result[]? | select((.type != "CNAME") or (.content != $target)) | "\(.type) \(.name) -> \(.content)"'
 }
 
 cf_upsert_dns() {
     hostname="$1"
     content="$CF_TUNNEL_ID.cfargotunnel.com"
+    conflicts=$(cf_dns_conflicts "$hostname" "$content") || return 1
+    if [ -n "$conflicts" ]; then
+        err "Cloudflare DNS 存在冲突记录，请先删除或改名："
+        printf '%s\n' "$conflicts" >&2
+        return 1
+    fi
     body=$(jq -cn --arg type CNAME --arg name "$hostname" --arg content "$content" '{type:$type,name:$name,content:$content,proxied:true}')
     id=$(cf_dns_record_id "$hostname")
     if [ -n "$id" ]; then
         say "更新 Cloudflare DNS：$hostname -> $content"
-        cf_api PUT "/zones/$CF_ZONE_ID/dns_records/$id" "$body" | jq -e '.success == true' >/dev/null
+        response=$(cf_api PUT "/zones/$CF_ZONE_ID/dns_records/$id" "$body") || return 1
     else
         say "创建 Cloudflare DNS：$hostname -> $content"
-        cf_api POST "/zones/$CF_ZONE_ID/dns_records" "$body" | jq -e '.success == true' >/dev/null
+        response=$(cf_api POST "/zones/$CF_ZONE_ID/dns_records" "$body") || return 1
     fi
+    cf_api_success "$response"
 }
 
 cf_delete_dns() {
@@ -695,10 +807,23 @@ cf_delete_dns() {
     id=$(cf_dns_record_id "$hostname")
     if [ -n "$id" ]; then
         say "删除 Cloudflare DNS：$hostname"
-        cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$id" | jq -e '.success == true' >/dev/null
+        response=$(cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$id") || return 1
+        cf_api_success "$response"
     else
         say "Cloudflare DNS 不存在，跳过：$hostname"
     fi
+}
+
+sync_managed_dns() {
+    for f in "$SITES_DIR"/*.env; do
+        [ -f "$f" ] || continue
+        HOSTNAME= MODE=
+        # shellcheck disable=SC1090
+        . "$f"
+        [ -n "$HOSTNAME" ] || continue
+        [ "$MODE" != "public" ] || continue
+        cf_upsert_dns "$HOSTNAME" || return 1
+    done
 }
 
 managed_hostnames_json() {
@@ -753,27 +878,26 @@ cf_get_tunnel_config() {
 }
 
 cf_sync_ingress() {
+    need_root
     require_config || return 1
+    sync_managed_dns || return 1
     current=$(cf_get_tunnel_config) || return 1
     managed_hosts=$(managed_hostnames_json)
     managed_ingress=$(managed_ingress_json)
-    body=$(printf '%s' "$current" | jq -c \
-        --argjson managedHosts "$managed_hosts" \
-        --argjson managedIngress "$managed_ingress" \
-        '{config:{ingress:((.result.config.ingress // []) | map(select((.hostname // "") as $h | ($managedHosts | index($h) | not))) | map(select(.service != "http_status:404")) + $managedIngress + [{service:"http_status:404"}])}}') || return 1
-    say "同步 Cloudflare Tunnel ingress。"
-    cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body" | jq -e '.success == true' >/dev/null
+    body=$(printf '%s' "$current" | jq -c         --argjson managedHosts "$managed_hosts"         --argjson managedIngress "$managed_ingress"         '{config:{ingress:((.result.config.ingress // []) | map(select((.hostname // "") as $h | ($managedHosts | index($h) | not))) | map(select(.service != "http_status:404")) + $managedIngress + [{service:"http_status:404"}])}}') || return 1
+    say "同步 Cloudflare DNS 和 Tunnel ingress。"
+    response=$(cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body") || return 1
+    cf_api_success "$response"
 }
 
 cf_remove_ingress_hostname() {
     hostname="$1"
     require_config || return 1
     current=$(cf_get_tunnel_config) || return 1
-    body=$(printf '%s' "$current" | jq -c \
-        --arg hostname "$hostname" \
-        '{config:{ingress:((.result.config.ingress // []) | map(select((.hostname // "") != $hostname)) | map(select(.service != "http_status:404")) + [{service:"http_status:404"}])}}') || return 1
+    body=$(printf '%s' "$current" | jq -c         --arg hostname "$hostname"         '{config:{ingress:((.result.config.ingress // []) | map(select((.hostname // "") != $hostname)) | map(select(.service != "http_status:404")) + [{service:"http_status:404"}])}}') || return 1
     say "移除 Cloudflare Tunnel ingress：$hostname"
-    cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body" | jq -e '.success == true' >/dev/null
+    response=$(cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body") || return 1
+    cf_api_success "$response"
 }
 
 mode_choice_number() {
@@ -820,7 +944,28 @@ choose_host_header() {
     esac
 }
 
+restore_site_from_file() {
+    backup_file="$1"
+    [ -f "$backup_file" ] || return 1
+    HOSTNAME= TARGET= MODE= UPSTREAM_HOST= CUSTOM_HOST= LISTEN_PORT=
+    # shellcheck disable=SC1090
+    . "$backup_file"
+    [ -n "$HOSTNAME" ] || return 1
+    cp "$backup_file" "$(site_env_path "$HOSTNAME")"
+    case "$MODE" in
+        proxy|mirror|cfcdn|public) render_site_nginx "$HOSTNAME" "$TARGET" "$MODE" "$UPSTREAM_HOST" "$CUSTOM_HOST" "$LISTEN_PORT" >/dev/null 2>&1 || true ;;
+        direct) rm -f "$(site_conf_path "$HOSTNAME")" ;;
+    esac
+}
+
+rollback_new_site() {
+    hostname="$1"
+    rm -f "$(site_conf_path "$hostname")" "$(site_env_path "$hostname")"
+    reload_nginx_if_needed >/dev/null 2>&1 || true
+}
+
 add_site() {
+    need_root
     load_config
     ensure_dirs
     hostname=$(read_input "公网域名，例如 app.example.com" "")
@@ -876,9 +1021,9 @@ add_site() {
     if [ "$mode" = "direct" ]; then
         rm -f "$(site_conf_path "$hostname")"
     else
-        render_site_nginx "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port"
-        if ! nginx_reload_safe; then
-            err "Nginx 配置测试失败，请检查 $(site_conf_path "$hostname")。"
+        if ! render_site_nginx "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port" || ! nginx_reload_safe; then
+            rm -f "$(site_conf_path "$hostname")" "$(site_env_path "$hostname")"
+            err "Nginx 配置测试失败，已回滚本次新增。"
             return 1
         fi
     fi
@@ -886,8 +1031,13 @@ add_site() {
         say "新增完成：https://$hostname:$listen_port -> $target [public]"
         say "请确认域名已解析到本机公网 IP，且防火墙/安全组已放行 TCP $listen_port。"
     else
-        cf_upsert_dns "$hostname" || return 1
-        cf_sync_ingress || return 1
+        if ! cf_sync_ingress; then
+            cf_delete_dns "$hostname" >/dev/null 2>&1 || true
+            cf_remove_ingress_hostname "$hostname" >/dev/null 2>&1 || true
+            rollback_new_site "$hostname"
+            err "Cloudflare 同步失败，已回滚本次新增。"
+            return 1
+        fi
         say "新增完成：https://$hostname -> $target [$mode]"
     fi
 }
@@ -949,6 +1099,7 @@ select_site_file() {
 }
 
 edit_site() {
+    need_root
     load_config
     select_site_file || return 1
     f="$SELECTED_SITE_FILE"
@@ -1009,45 +1160,82 @@ edit_site() {
     fi
 
     backup_managed_files
+    old_site_backup=$(mktemp)
+    cp "$f" "$old_site_backup" 2>/dev/null || true
     if [ "$new_hostname" != "$old_hostname" ]; then
         rm -f "$old_conf" "$f"
     fi
     save_site_env "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port"
     if [ "$mode" = "direct" ]; then
         rm -f "$(site_conf_path "$new_hostname")"
-        if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ] || [ "$old_mode" = "public" ]; then
-            nginx_reload_safe || warn "旧 Nginx 站点配置已删除，但 Nginx reload 失败，请手动检查。"
-        else
-            reload_nginx_if_needed || warn "已有 Nginx 站点配置测试失败，请检查 Nginx 配置。"
+        if ! reload_nginx_if_needed; then
+            rm -f "$(site_env_path "$new_hostname")" "$(site_conf_path "$new_hostname")"
+            restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
+            reload_nginx_if_needed >/dev/null 2>&1 || true
+            rm -f "$old_site_backup"
+            err "Nginx 配置测试失败，已尝试回滚本次修改。"
+            return 1
         fi
     else
-        render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port"
-        if ! nginx_reload_safe; then
-            err "Nginx 配置测试失败。"
+        if ! render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port" || ! nginx_reload_safe; then
+            rm -f "$(site_conf_path "$new_hostname")" "$(site_env_path "$new_hostname")"
+            cp "$old_site_backup" "$f" 2>/dev/null || true
+            if [ -f "$f" ]; then
+                R_HOSTNAME= R_TARGET= R_MODE= R_UPSTREAM_HOST= R_CUSTOM_HOST= R_LISTEN_PORT=
+                # shellcheck disable=SC1090
+                . "$f"
+                R_HOSTNAME="$HOSTNAME"
+                R_TARGET="$TARGET"
+                R_MODE="$MODE"
+                R_UPSTREAM_HOST="$UPSTREAM_HOST"
+                R_CUSTOM_HOST="$CUSTOM_HOST"
+                R_LISTEN_PORT="$LISTEN_PORT"
+                [ -n "$R_HOSTNAME" ] && render_site_nginx "$R_HOSTNAME" "$R_TARGET" "$R_MODE" "$R_UPSTREAM_HOST" "$R_CUSTOM_HOST" "$R_LISTEN_PORT" >/dev/null 2>&1 || true
+            fi
+            rm -f "$old_site_backup"
+            err "Nginx 配置测试失败，已尝试回滚本次修改。"
             return 1
         fi
     fi
     if [ "$old_mode" != "public" ] && [ "$mode" != "public" ]; then
-        if [ "$new_hostname" != "$old_hostname" ]; then
-            cf_delete_dns "$old_hostname" || warn "删除旧 DNS 失败：$old_hostname"
-            cf_remove_ingress_hostname "$old_hostname" || warn "移除旧 Tunnel ingress 失败：$old_hostname"
-        fi
+        :
     fi
     if [ "$mode" = "public" ]; then
         if [ "$old_mode" != "public" ]; then
-            cf_delete_dns "$old_hostname" || warn "删除旧 DNS 失败：$old_hostname"
-            cf_remove_ingress_hostname "$old_hostname" || warn "移除旧 Tunnel ingress 失败：$old_hostname"
+            if ! cf_remove_ingress_hostname "$old_hostname" || ! cf_delete_dns "$old_hostname"; then
+                rm -f "$(site_conf_path "$new_hostname")" "$(site_env_path "$new_hostname")"
+                restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
+                reload_nginx_if_needed >/dev/null 2>&1 || true
+                rm -f "$old_site_backup"
+                err "Cloudflare 旧入口清理失败，已尝试回滚本次修改。"
+                return 1
+            fi
         fi
+        rm -f "$old_site_backup"
         say "修改完成：https://$new_hostname:$listen_port -> $target [public]"
         say "请确认域名已解析到本机公网 IP，且防火墙/安全组已放行 TCP $listen_port。"
     else
-        cf_upsert_dns "$new_hostname" || return 1
-        cf_sync_ingress || return 1
+        if ! cf_sync_ingress; then
+            cf_delete_dns "$new_hostname" >/dev/null 2>&1 || true
+            cf_remove_ingress_hostname "$new_hostname" >/dev/null 2>&1 || true
+            rm -f "$(site_conf_path "$new_hostname")" "$(site_env_path "$new_hostname")"
+            restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
+            reload_nginx_if_needed >/dev/null 2>&1 || true
+            rm -f "$old_site_backup"
+            err "Cloudflare 同步失败，已尝试回滚本次修改。"
+            return 1
+        fi
+        if [ "$new_hostname" != "$old_hostname" ] && [ "$old_mode" != "public" ]; then
+            cf_remove_ingress_hostname "$old_hostname" || warn "旧 Tunnel ingress 删除失败：$old_hostname，请手动检查。"
+            cf_delete_dns "$old_hostname" || warn "旧 DNS 删除失败：$old_hostname，请手动检查。"
+        fi
+        rm -f "$old_site_backup"
         say "修改完成：https://$new_hostname -> $target [$mode]"
     fi
 }
 
 delete_site() {
+    need_root
     load_config
     select_site_file || return 1
     f="$SELECTED_SITE_FILE"
@@ -1063,6 +1251,10 @@ delete_site() {
         confirm "确认删除该反代及 Cloudflare DNS/ingress？" || return 0
     fi
     backup_managed_files
+    if [ "$old_mode" != "public" ]; then
+        cf_remove_ingress_hostname "$HOSTNAME" || return 1
+        cf_delete_dns "$HOSTNAME" || return 1
+    fi
     rm -f "$(site_conf_path "$HOSTNAME")" "$f"
     if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ] || [ "$old_mode" = "public" ]; then
         if ! nginx_reload_safe; then
@@ -1073,13 +1265,7 @@ delete_site() {
         err "删除后 Nginx 配置测试失败。备份位于 $BACKUP_DIR。"
         return 1
     fi
-    if [ "$old_mode" = "public" ]; then
-        say "删除完成：$HOSTNAME"
-    else
-        cf_delete_dns "$HOSTNAME" || warn "删除 DNS 失败：$HOSTNAME"
-        cf_remove_ingress_hostname "$HOSTNAME" || warn "移除 Tunnel ingress 失败：$HOSTNAME"
-        say "删除完成：$HOSTNAME"
-    fi
+    say "删除完成：$HOSTNAME"
 }
 
 service_status_label() {
@@ -1132,6 +1318,7 @@ show_logs() {
 }
 
 uninstall_manager() {
+    need_root
     ui_header "卸载 $APP_NAME"
     ui_section "将删除"
     printf '  - %s\n' "$CONFIG_DIR"
@@ -1192,6 +1379,7 @@ local_test_site() {
 }
 
 manage_services() {
+    need_root
     while :; do
         ui_header "服务管理"
         show_status_card
@@ -1238,6 +1426,7 @@ manage_services() {
 }
 
 site_menu() {
+    need_root
     while :; do
         ui_header "反代管理"
         show_status_card
@@ -1247,7 +1436,7 @@ site_menu() {
         ui_menu_item 3 "查看反代列表"
         printf '\n'
         ui_section "Cloudflare"
-        ui_menu_item 4 "同步 Cloudflare Tunnel ingress"
+        ui_menu_item 4 "同步 Cloudflare DNS 和 Tunnel ingress"
         ui_back_item 0 "返回主菜单"
         ui_prompt
         IFS= read -r c </dev/tty

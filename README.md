@@ -9,7 +9,7 @@
 - 可以让 Tunnel 直接连到目标服务。
 - 也可以让 Tunnel 先到 VPS 本地 Nginx，再由 Nginx 反代。
 - 新增、修改、删除反代都用菜单完成。
-- 自动帮你配置 Cloudflare DNS 和 Tunnel 入口。
+- 自动帮你配置 Cloudflare DNS 和 Tunnel ingress。
 
 访问链路有两种：
 
@@ -61,7 +61,7 @@ Nginx 反代模式：
 - 删除反代。
 - 查看反代列表。
 - 自动创建 Cloudflare DNS CNAME。
-- 自动更新 Cloudflare Tunnel Public Hostname。
+- 自动更新 Cloudflare Tunnel ingress。
 - 也可以创建不走 Tunnel 的公网 HTTPS 入站反代。
 - 启动、停止、重启 `nginx` 和 `cloudflared`。
 
@@ -109,7 +109,7 @@ Cloudflare Zone ID
 Cloudflare API Token
 ```
 
-脚本会用 API Token 自动创建 Cloudflare Tunnel，并保存 Tunnel ID 和 Tunnel Token。
+如果选择配置 Tunnel，脚本会用 API Token 自动创建 Cloudflare Tunnel，并保存 Tunnel ID 和 Tunnel Token。
 
 这些信息准备好后，脚本会保存到：
 
@@ -126,7 +126,7 @@ Cloudflare API Token
 1. 一个已经托管到 Cloudflare 的域名。
 2. 一个有权限操作 DNS 和 Tunnel 的 API Token。
 
-每台 VPS 初始化时，脚本会自动创建一个独立的 Cloudflare Tunnel。不要在多台 VPS 上共用同一个 Tunnel Token，除非这些机器提供完全相同的服务和 Nginx 配置。
+每台 VPS 建议创建并使用自己的独立 Cloudflare Tunnel。配置时如果已有 Tunnel，脚本会让你选择“创建新的独立 Tunnel”或“沿用当前 Tunnel”。不要在多台 VPS 上共用同一个 Tunnel Token，除非这些机器提供完全相同的服务和 Nginx 配置。
 
 ## 怎么获取 Account ID 和 Zone ID
 
@@ -163,9 +163,11 @@ Zone / DNS / Edit
 
 ## Cloudflare Tunnel
 
-首次初始化时，脚本会通过 API 自动创建 Cloudflare Tunnel，并获取本机 `cloudflared` 服务需要的 Tunnel Token。
+首次初始化时，如果选择配置 Tunnel，脚本会通过 API 自动创建 Cloudflare Tunnel，并获取本机 `cloudflared` 服务需要的 Tunnel Token。
 
 默认每台 VPS 应该创建并使用自己的独立 Tunnel。Cloudflare 会把同一个 Tunnel Token 下的多台机器当成同一个入口池，如果这些机器的本地服务不同，公网访问可能会随机分配到错误机器并出现 `502 Bad Gateway`。
+
+如果你只使用「Nginx 公网入站反代」模式，可以不配置 Tunnel；仍然需要 Cloudflare API Token 用于 DNS 验证申请证书。
 
 ## 新增一个反代
 
@@ -199,8 +201,9 @@ example.com
 
 如果选择 Tunnel 直连模式，脚本会自动：
 
-- 创建 Cloudflare DNS。
-- 更新 Tunnel 入口，让 Tunnel 直接指向目标地址。
+- 创建或更新 Cloudflare DNS CNAME。
+- 如果同名 A/AAAA 等 DNS 记录冲突，会提示先删除或改名。
+- 更新 Tunnel ingress，让 Tunnel 直接指向目标地址。
 - 不生成 Nginx 配置。
 
 如果选择 Nginx 反代模式，脚本会自动：
@@ -208,8 +211,9 @@ example.com
 - 生成 Nginx 配置。
 - 测试 Nginx 配置。
 - 重载 Nginx。
-- 创建 Cloudflare DNS。
-- 更新 Tunnel 入口，让 Tunnel 指向 `http://127.0.0.1:8080`。
+- 创建或更新 Cloudflare DNS CNAME。
+- 如果同名 A/AAAA 等 DNS 记录冲突，会提示先删除或改名。
+- 更新 Tunnel ingress，让 Tunnel 指向 `http://127.0.0.1:8080`。
 
 然后访问：
 
@@ -295,6 +299,12 @@ https://target.example.com
 ```text
 https://app.example.com:52443
 ```
+
+## Nginx 上游 DNS 和 IPv6
+
+Nginx 反代模式会使用系统 `/etc/resolv.conf` 里的 DNS 服务器解析上游域名。如果没有读取到可用的 `nameserver`，脚本会回退到 `1.1.1.1 8.8.8.8`。
+
+初始化时可以选择是否启用 Nginx 上游 IPv6 解析，默认关闭。没有 IPv6 出口的 VPS 建议保持关闭，否则 Nginx 可能解析到 IPv6 上游后出现 `Network unreachable` 和 `502 Bad Gateway`。
 
 ## 常用菜单
 
@@ -415,4 +425,4 @@ cf-nginx-manager uninstall
 - Cloudflare Tunnel 远端 Public Hostname / ingress。
 - `/etc/nginx/certs/` 里的其他证书目录。
 
-Cloudflare 上已经创建的 DNS 和 Tunnel Public Hostname，建议先用脚本删除反代，再卸载。否则需要到 Cloudflare 后台手动删除。
+Cloudflare 上已经创建的 DNS 和 Tunnel ingress，建议先用脚本删除反代，再卸载。否则需要到 Cloudflare 后台手动删除。
