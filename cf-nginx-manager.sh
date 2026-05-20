@@ -434,6 +434,7 @@ configure_credentials() {
     fi
     discover_cloudflare_ids
     LOCAL_SERVICE=$(read_input "本机 Nginx 服务地址" "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}")
+    nginx_service_url "$LOCAL_SERVICE" >/dev/null || return 1
     if confirm_default_no "是否启用 Nginx 上游 IPv6 解析？没有 IPv6 出口的 VPS 请保持关闭"; then
         UPSTREAM_IPV6=1
     else
@@ -534,13 +535,14 @@ install_dependencies() {
 }
 
 render_cloudflared_openrc() {
-    cat > "$CLOUDFLARED_INIT" <<'EOF'
+    cloudflared_path=$(command -v cloudflared 2>/dev/null || printf '%s' /usr/bin/cloudflared)
+    cat > "$CLOUDFLARED_INIT" <<EOF
 #!/sbin/openrc-run
 
 name="cloudflared"
 description="Cloudflare Tunnel"
 supervisor="supervise-daemon"
-command="/usr/bin/cloudflared"
+command="$cloudflared_path"
 pidfile="/run/cloudflared.pid"
 output_log="/var/log/cloudflared.log"
 error_log="/var/log/cloudflared.log"
@@ -552,11 +554,11 @@ start_pre() {
         . /etc/cf-nginx-manager/config.env
     fi
     checkpath -f -m 0600 -o root:root /var/log/cloudflared.log
-    if [ -z "${CF_TUNNEL_TOKEN}" ]; then
+    if [ -z "\${CF_TUNNEL_TOKEN}" ]; then
         eerror "CF_TUNNEL_TOKEN is empty. Configure /etc/cf-nginx-manager/config.env first."
         return 1
     fi
-    command_args="tunnel run --token ${CF_TUNNEL_TOKEN}"
+    command_args="tunnel run --token \${CF_TUNNEL_TOKEN}"
 }
 
 depend() {
@@ -617,7 +619,8 @@ init_environment() {
         render_cloudflared_openrc
         service_add_default cloudflared
     fi
-    nginx -t && rc-service nginx restart
+    nginx -t || return 1
+    rc-service nginx restart || return 1
     if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
         rc-service cloudflared restart || warn "cloudflared 启动失败，请检查 token 或日志：$CLOUDFLARED_LOG"
     fi
@@ -628,6 +631,7 @@ normalize_target() {
     raw="$1"
     case "$raw" in
         http://*|https://*) target="$raw" ;;
+        *://*) target="$raw" ;;
         *:*) target="http://$raw" ;;
         *) target="https://$raw" ;;
     esac
@@ -661,6 +665,46 @@ target_path_prefix() {
     done
     [ "$path" = "/" ] && path=""
     printf '%s' "$path"
+}
+
+validate_http_target() {
+    scheme=$(target_scheme "$1")
+    case "$scheme" in
+        http|https) return 0 ;;
+        *) err "目标地址只支持 http:// 或 https://。"; return 1 ;;
+    esac
+}
+
+nginx_service_url() {
+    service="${1:-$LOCAL_SERVICE_DEFAULT}"
+    scheme=$(target_scheme "$service")
+    authority=$(target_authority "$service")
+    path_prefix=$(target_path_prefix "$service")
+    if [ "$scheme" != "http" ] || [ -z "$authority" ] || [ -n "$path_prefix" ]; then
+        err "本机 Nginx 服务地址必须是 http://HOST:PORT，且不能带路径。"
+        return 1
+    fi
+    case "$authority" in
+        \[*\]:*) ;;
+        \[*\]) err "本机 Nginx 服务地址必须显式填写端口。"; return 1 ;;
+        *:*) ;;
+        *) err "本机 Nginx 服务地址必须显式填写端口。"; return 1 ;;
+    esac
+    port=$(printf '%s' "$authority" | sed 's/^.*://; s/]//g')
+    if ! validate_port "$port"; then
+        err "本机 Nginx 服务地址端口不合法。"
+        return 1
+    fi
+    if ! validate_nginx_value "$authority"; then
+        err "本机 Nginx 服务地址包含不安全字符。"
+        return 1
+    fi
+    printf 'http://%s' "$authority"
+}
+
+nginx_listen_from_service() {
+    service_url=$(nginx_service_url "$1") || return 1
+    target_authority "$service_url"
 }
 
 ensure_crond() {
@@ -870,6 +914,11 @@ render_site_nginx() {
     scheme=$(target_scheme "$target")
     host_only=$(target_host_only "$target")
     path_prefix=$(target_path_prefix "$target")
+    if [ "$mode" = "public" ]; then
+        nginx_listen=""
+    else
+        nginx_listen=$(nginx_listen_from_service "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}") || return 1
+    fi
     if ! validate_proxy_path "$path_prefix"; then
         err "目标路径包含不安全字符。"
         return 1
@@ -881,25 +930,12 @@ render_site_nginx() {
 
     tmp="$conf.tmp"
     {
-        if [ "$mode" = "public" ]; then
-            if [ "$listen_port" = "443" ]; then
-                public_redirect_base="https://$hostname"
-            else
-                public_redirect_base="https://$hostname:$listen_port"
-            fi
-            printf 'server {\n'
-            printf '    listen 80;\n'
-            printf '    listen [::]:80;\n'
-            printf '    server_name %s;\n\n' "$hostname"
-            printf '    return 301 %s$request_uri;\n' "$public_redirect_base"
-            printf '}\n\n'
-        fi
         printf 'server {\n'
         if [ "$mode" = "public" ]; then
             printf '    listen %s ssl;\n' "$listen_port"
             printf '    listen [::]:%s ssl;\n' "$listen_port"
         else
-            printf '    listen 127.0.0.1:8080;\n'
+            printf '    listen %s;\n' "$nginx_listen"
         fi
         printf '    server_name %s;\n\n' "$hostname"
         if [ "$mode" = "public" ]; then
@@ -907,8 +943,14 @@ render_site_nginx() {
             printf '    ssl_certificate_key %s/private.key;\n' "$cert_dir"
             printf '    ssl_session_cache shared:%s:10m;\n' "$ssl_cache_zone"
             printf '    ssl_session_timeout 10m;\n'
+            if [ "$listen_port" = "443" ]; then
+                public_redirect_base="https://$hostname"
+            else
+                public_redirect_base="https://$hostname:$listen_port"
+            fi
             printf '    ssl_protocols TLSv1.2 TLSv1.3;\n'
-            printf '    ssl_prefer_server_ciphers off;\n\n'
+            printf '    ssl_prefer_server_ciphers off;\n'
+            printf '    error_page 497 =301 %s$request_uri;\n\n' "$public_redirect_base"
         fi
         resolvers=$(system_resolvers)
         if [ "$UPSTREAM_IPV6" = "1" ]; then
@@ -1113,8 +1155,9 @@ cf_dns_records() {
 
 cf_dns_record_id() {
     hostname="$1"
+    content="$2"
     response=$(cf_dns_records "$hostname") || return 1
-    printf '%s' "$response" | jq -r '.result[]? | select(.type == "CNAME") | .id' | head -n 1
+    printf '%s' "$response" | jq -r --arg content "$content" '.result[]? | select(.type == "CNAME" and .content == $content) | .id' | head -n 1
 }
 
 cf_dns_conflicts() {
@@ -1152,7 +1195,7 @@ cf_upsert_dns() {
         cf_delete_dns_record_ids "$conflict_ids" || return 1
     fi
     body=$(jq -cn --arg type CNAME --arg name "$hostname" --arg content "$content" '{type:$type,name:$name,content:$content,proxied:true}')
-    id=$(cf_dns_record_id "$hostname")
+    id=$(cf_dns_record_id "$hostname" "$content")
     if [ -n "$id" ]; then
         say "更新 Cloudflare DNS：$hostname -> $content"
         response=$(cf_api PUT "/zones/$CF_ZONE_ID/dns_records/$id" "$body") || return 1
@@ -1165,17 +1208,28 @@ cf_upsert_dns() {
 
 cf_delete_dns() {
     hostname="$1"
-    id=$(cf_dns_record_id "$hostname")
+    content="$CF_TUNNEL_ID.cfargotunnel.com"
+    id=$(cf_dns_record_id "$hostname" "$content")
     if [ -n "$id" ]; then
-        say "删除 Cloudflare DNS：$hostname"
+        say "删除 Cloudflare DNS：$hostname -> $content"
         response=$(cf_api DELETE "/zones/$CF_ZONE_ID/dns_records/$id") || return 1
         cf_api_success "$response"
     else
-        say "Cloudflare DNS 不存在，跳过：$hostname"
+        say "本脚本管理的 Cloudflare DNS 不存在，跳过：$hostname"
     fi
 }
 
-cf_dns_record_ids_by_type() {
+cf_dns_record_ids_by_value() {
+    hostname="$1"
+    record_type="$2"
+    content="$3"
+    proxied="$4"
+    [ "$proxied" = "1" ] && proxied_json=true || proxied_json=false
+    response=$(cf_dns_records "$hostname") || return 1
+    printf '%s' "$response" | jq -r --arg type "$record_type" --arg content "$content" --argjson proxied "$proxied_json" '.result[]? | select(.type == $type and .content == $content and .proxied == $proxied) | .id'
+}
+
+cf_dns_record_ids_by_name() {
     hostname="$1"
     record_type="$2"
     response=$(cf_dns_records "$hostname") || return 1
@@ -1186,17 +1240,6 @@ cf_delete_dns_record_id() {
     record_id="$1"
     response=$(cf_api_request DELETE "/zones/$CF_ZONE_ID/dns_records/$record_id") || return 1
     cf_api_success "$response"
-}
-
-cf_delete_dns_type() {
-    hostname="$1"
-    record_type="$2"
-    ids=$(cf_dns_record_ids_by_type "$hostname" "$record_type") || return 1
-    [ -n "$ids" ] || return 0
-    printf '%s\n' "$ids" | while IFS= read -r id; do
-        [ -n "$id" ] || continue
-        cf_delete_dns_record_id "$id" || exit 1
-    done
 }
 
 detect_public_ipv4() {
@@ -1331,10 +1374,22 @@ cf_upsert_public_dns() {
 
 cf_delete_public_dns() {
     hostname="$1"
+    ipv4="${2:-}"
+    ipv6="${3:-}"
+    proxied="${4:-0}"
     require_dns_config || return 1
     say "删除 Cloudflare 公网 DNS：$hostname"
-    cf_delete_dns_type "$hostname" A || return 1
-    cf_delete_dns_type "$hostname" AAAA || return 1
+    if [ -n "$ipv4" ]; then
+        ids=$(cf_dns_record_ids_by_value "$hostname" A "$ipv4" "$proxied") || return 1
+    else
+        ids=$(cf_dns_record_ids_by_name "$hostname" A) || return 1
+        [ -z "$ids" ] || confirm "未保存旧 IPv4，是否删除 $hostname 的全部 A 记录？" || return 1
+    fi
+    cf_delete_dns_record_ids "$ids" || return 1
+    if [ -n "$ipv6" ]; then
+        ids=$(cf_dns_record_ids_by_value "$hostname" AAAA "$ipv6" "$proxied") || return 1
+        cf_delete_dns_record_ids "$ids" || return 1
+    fi
 }
 
 sync_managed_dns() {
@@ -1407,7 +1462,7 @@ cf_sync_ingress() {
     current=$(cf_get_tunnel_config) || return 1
     managed_hosts=$(managed_hostnames_json)
     managed_ingress=$(managed_ingress_json)
-    body=$(printf '%s' "$current" | jq -c         --argjson managedHosts "$managed_hosts"         --argjson managedIngress "$managed_ingress"         '{config:{ingress:((.result.config.ingress // []) | map(select((.hostname // "") as $h | ($managedHosts | index($h) | not))) | map(select(.service != "http_status:404")) + $managedIngress + [{service:"http_status:404"}])}}') || return 1
+    body=$(printf '%s' "$current" | jq -c         --argjson managedHosts "$managed_hosts"         --argjson managedIngress "$managed_ingress"         '{config:((.result.config // {}) | .ingress = (((.ingress // []) | map(select((.hostname // "") as $h | ($managedHosts | index($h) | not))) | map(select(.service != "http_status:404")) + $managedIngress + [{service:"http_status:404"}])))}') || return 1
     say "同步 Cloudflare DNS 和 Tunnel ingress。"
     response=$(cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body") || return 1
     cf_api_success "$response"
@@ -1417,7 +1472,7 @@ cf_remove_ingress_hostname() {
     hostname="$1"
     require_config || return 1
     current=$(cf_get_tunnel_config) || return 1
-    body=$(printf '%s' "$current" | jq -c         --arg hostname "$hostname"         '{config:{ingress:((.result.config.ingress // []) | map(select((.hostname // "") != $hostname)) | map(select(.service != "http_status:404")) + [{service:"http_status:404"}])}}') || return 1
+    body=$(printf '%s' "$current" | jq -c         --arg hostname "$hostname"         '{config:((.result.config // {}) | .ingress = (((.ingress // []) | map(select((.hostname // "") != $hostname)) | map(select(.service != "http_status:404")) + [{service:"http_status:404"}])))}') || return 1
     say "移除 Cloudflare Tunnel ingress：$hostname"
     response=$(cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body") || return 1
     cf_api_success "$response"
@@ -1442,10 +1497,12 @@ choose_mode() {
     printf '%s\n' "3) Nginx 网站镜像反代（经过 Tunnel，仅适合简单网页）" >/dev/tty
     printf '%s\n' "4) Nginx 代理 CF CDN 目标站（经过 Tunnel，目标站本身套了 Cloudflare 时用）" >/dev/tty
     printf '%s\n' "5) Nginx 公网入站反代（不使用 Cloudflare Tunnel，需要开放入站端口）" >/dev/tty
+    printf '%s\n' "0) 取消" >/dev/tty
     printf '选择 [%s]: ' "$default_choice" >/dev/tty
     IFS= read -r choice </dev/tty
     [ -n "$choice" ] || choice="$default_choice"
     case "$choice" in
+        0) return 1 ;;
         2) printf 'proxy' ;;
         3) printf 'mirror' ;;
         4) printf 'cfcdn' ;;
@@ -1503,12 +1560,13 @@ add_site() {
         err "目标地址包含不安全字符。"
         return 1
     fi
+    validate_http_target "$target" || return 1
     upstream_host=$(target_authority "$target")
     if ! validate_host_header "$upstream_host"; then
         err "无法从目标地址解析出安全的上游 Host。"
         return 1
     fi
-    mode=$(choose_mode direct)
+    mode=$(choose_mode direct) || return 0
     service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
     custom_host=""
     listen_port=""
@@ -1656,12 +1714,13 @@ edit_site() {
         err "目标地址包含不安全字符。"
         return 1
     fi
+    validate_http_target "$target" || return 1
     upstream_host=$(target_authority "$target")
     if ! validate_host_header "$upstream_host"; then
         err "无法从目标地址解析出安全的上游 Host。"
         return 1
     fi
-    mode=$(choose_mode "${MODE:-direct}")
+    mode=$(choose_mode "${MODE:-direct}") || return 0
     service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
     custom_host=""
     listen_port=""
@@ -1748,7 +1807,7 @@ edit_site() {
         fi
         if [ "$old_mode" != "public" ]; then
             if ! cf_remove_ingress_hostname "$old_hostname" || ! cf_delete_dns "$old_hostname"; then
-                cf_delete_public_dns "$new_hostname" >/dev/null 2>&1 || true
+                cf_delete_public_dns "$new_hostname" "$public_ipv4" "$public_ipv6" "$public_dns_proxied" >/dev/null 2>&1 || true
                 rm -f "$(site_conf_path "$new_hostname")" "$(site_env_path "$new_hostname")"
                 restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
                 reload_nginx_if_needed >/dev/null 2>&1 || true
@@ -1758,14 +1817,14 @@ edit_site() {
                 return 1
             fi
         elif [ "$new_hostname" != "$old_hostname" ]; then
-            cf_delete_public_dns "$old_hostname" || warn "旧公网 DNS 删除失败：$old_hostname，请手动检查。"
+            cf_delete_public_dns "$old_hostname" "$old_public_ipv4" "$old_public_ipv6" "$old_public_dns_proxied" || warn "旧公网 DNS 删除失败：$old_hostname，请手动检查。"
         fi
         rm -f "$old_site_backup"
         say "修改完成：https://$new_hostname:$listen_port -> $target [public]"
         say "请确认防火墙/安全组已放行 TCP $listen_port。"
     else
         if [ "$old_mode" = "public" ]; then
-            cf_delete_public_dns "$old_hostname" || warn "旧公网 DNS 删除失败：$old_hostname，请手动检查。"
+            cf_delete_public_dns "$old_hostname" "$old_public_ipv4" "$old_public_ipv6" "$old_public_dns_proxied" || warn "旧公网 DNS 删除失败：$old_hostname，请手动检查。"
         fi
         if ! cf_sync_ingress; then
             cf_delete_dns "$new_hostname" >/dev/null 2>&1 || true
@@ -1794,7 +1853,7 @@ delete_site() {
     load_config
     select_site_file || return 1
     f="$SELECTED_SITE_FILE"
-    HOSTNAME= TARGET= MODE=
+    HOSTNAME= TARGET= MODE= PUBLIC_DNS_PROXIED= PUBLIC_IPV4= PUBLIC_IPV6=
     # shellcheck disable=SC1090
     . "$f"
     old_mode="$MODE"
@@ -1811,7 +1870,7 @@ delete_site() {
         cf_remove_ingress_hostname "$HOSTNAME" || return 1
         cf_delete_dns "$HOSTNAME" || return 1
     else
-        cf_delete_public_dns "$HOSTNAME" || return 1
+        cf_delete_public_dns "$HOSTNAME" "${PUBLIC_IPV4:-}" "${PUBLIC_IPV6:-}" "${PUBLIC_DNS_PROXIED:-0}" || return 1
     fi
     rm -f "$(site_conf_path "$HOSTNAME")" "$f"
     if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ] || [ "$old_mode" = "public" ]; then
@@ -1853,7 +1912,14 @@ site_count() {
 show_status_card() {
     ui_section "服务状态"
     print_service_status_line nginx nginx nginx
-    print_service_status_line cloudflared cloudflared cloudflared
+    load_config
+    if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
+        print_service_status_line cloudflared cloudflared cloudflared
+    else
+        printf '  %-12s: ' "cloudflared"
+        ui_warn '未配置'
+        printf '\n'
+    fi
     printf '  %-12s: %s 个\n' "反代站点" "$(site_count)"
     printf '\n'
 }
@@ -1967,7 +2033,8 @@ local_test_site() {
             return $?
         fi
     fi
-    curl -I -H "Host: $hostname" http://127.0.0.1:8080/
+    service_url=$(nginx_service_url "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}") || return 1
+    curl -I -H "Host: $hostname" "$service_url/"
 }
 
 manage_services() {
