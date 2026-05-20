@@ -1762,6 +1762,15 @@ show_logs() {
     fi
 }
 
+remove_package_if_installed() {
+    pkg="$1"
+    cmd="$2"
+    if has_cmd "$cmd"; then
+        say "卸载软件包：$pkg"
+        apk del "$pkg" || return 1
+    fi
+}
+
 uninstall_manager() {
     need_root
     ui_header "卸载 $APP_NAME"
@@ -1774,13 +1783,21 @@ uninstall_manager() {
     printf '  - %s\n' "$INSTALL_BIN"
     printf '  - %s\n' "$LEGACY_BIN"
     printf '\n'
-    ui_section "不会删除"
-    printf '  - nginx / cloudflared 软件包\n'
+    ui_section "默认不会删除"
+    printf '  - nginx / cloudflared 软件包（后续可选择卸载）\n'
     printf '  - Cloudflare 后台已经存在的 DNS 记录\n'
     printf '  - Cloudflare Tunnel 远端配置\n'
     printf '  - %s 下的其他证书目录\n' "$CERT_HOME"
     printf '\n'
     confirm "确认卸载本机 $APP_NAME 管理文件？" || return 0
+    remove_nginx=0
+    remove_cloudflared=0
+    if confirm_default_no "是否同时卸载 nginx 软件包？"; then
+        remove_nginx=1
+    fi
+    if confirm_default_no "是否同时卸载 cloudflared 软件包？"; then
+        remove_cloudflared=1
+    fi
     confirm "再次确认：继续删除这些本地文件？" || return 0
 
     uninstall_backup="/root/${APP_NAME}-uninstall-backup-$(date +%Y%m%d-%H%M%S)"
@@ -1790,9 +1807,18 @@ uninstall_manager() {
     copy_existing_files "$uninstall_backup" "$CONFIG_ENV"
     rc-service cloudflared stop >/dev/null 2>&1 || true
     rc-update del cloudflared default >/dev/null 2>&1 || true
+    if [ "$remove_nginx" = 1 ]; then
+        rc-service nginx stop >/dev/null 2>&1 || true
+        rc-update del nginx default >/dev/null 2>&1 || true
+    fi
     remove_existing_files "$NGINX_PREFIX"*.conf "$NGINX_MAP_FILE" "$CLOUDFLARED_INIT" "$CLOUDFLARED_LOG" "$INSTALL_BIN" "$LEGACY_BIN"
     rm -rf "$CONFIG_DIR" 2>/dev/null || true
-    if has_cmd nginx; then
+    if [ "$remove_cloudflared" = 1 ]; then
+        remove_package_if_installed cloudflared cloudflared || warn "cloudflared 软件包卸载失败，请手动检查。"
+    fi
+    if [ "$remove_nginx" = 1 ]; then
+        remove_package_if_installed nginx nginx || warn "nginx 软件包卸载失败，请手动检查。"
+    elif has_cmd nginx; then
         nginx -t >/dev/null 2>&1 && rc-service nginx reload >/dev/null 2>&1 || true
     fi
     say "卸载完成。"
