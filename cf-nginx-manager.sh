@@ -258,13 +258,25 @@ require_config() {
 
 require_cf_api_token() {
     load_config
+    changed=0
+    if [ -z "${CF_ACCOUNT_ID:-}" ]; then
+        CF_ACCOUNT_ID=$(read_input "Cloudflare Account ID" "")
+        changed=1
+    fi
+    if [ -z "${CF_ZONE_ID:-}" ]; then
+        CF_ZONE_ID=$(read_input "Cloudflare Zone ID" "")
+        changed=1
+    fi
     if [ -z "${CF_API_TOKEN:-}" ]; then
         say "公网入站反代申请证书需要 Cloudflare API Token（至少 Zone / DNS / Edit 权限）。"
         CF_API_TOKEN=$(read_secret "Cloudflare API Token（输入不会回显）")
-        if [ -z "$CF_API_TOKEN" ]; then
-            err "Cloudflare API Token 不能为空。"
-            return 1
-        fi
+        changed=1
+    fi
+    if [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${CF_ZONE_ID:-}" ] || [ -z "${CF_API_TOKEN:-}" ]; then
+        err "Account ID、Zone ID、API Token 都不能为空。"
+        return 1
+    fi
+    if [ "$changed" = 1 ]; then
         save_config
     fi
 }
@@ -475,6 +487,8 @@ issue_cloudflare_cert() {
     mkdir -p "$cert_dir"
     ensure_acme_ready "$email" || return 1
     export CF_Token="$CF_API_TOKEN"
+    export CF_Zone_ID="$CF_ZONE_ID"
+    export CF_Account_ID="$CF_ACCOUNT_ID"
     say "申请证书：$domain"
     "$ACME_HOME/acme.sh" --issue --dns dns_cf -d "$domain" --keylength ec-256 || return 1
     "$ACME_HOME/acme.sh" --install-cert -d "$domain" --ecc \
@@ -743,7 +757,15 @@ cf_api_success() {
     if printf '%s' "$response" | jq -e '.success == true' >/dev/null 2>&1; then
         return 0
     fi
-    printf '%s' "$response" | jq -r '.errors[]?.message // empty' >&2
+    messages=$(printf '%s' "$response" | jq -r '.errors[]?.message // empty' 2>/dev/null)
+    if [ -n "$messages" ]; then
+        printf '%s\n' "$messages" >&2
+    elif [ -n "$response" ]; then
+        printf '%s\n' "$response" | head -c 500 >&2
+        printf '\n' >&2
+    else
+        err "Cloudflare API 未返回响应。"
+    fi
     return 1
 }
 
@@ -1168,7 +1190,16 @@ edit_site() {
     save_site_env "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port"
     if [ "$mode" = "direct" ]; then
         rm -f "$(site_conf_path "$new_hostname")"
-        if ! reload_nginx_if_needed; then
+        if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ] || [ "$old_mode" = "public" ]; then
+            if ! nginx_reload_safe; then
+                rm -f "$(site_env_path "$new_hostname")" "$(site_conf_path "$new_hostname")"
+                restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
+                reload_nginx_if_needed >/dev/null 2>&1 || true
+                rm -f "$old_site_backup"
+                err "Nginx 配置测试失败，已尝试回滚本次修改。"
+                return 1
+            fi
+        elif ! reload_nginx_if_needed; then
             rm -f "$(site_env_path "$new_hostname")" "$(site_conf_path "$new_hostname")"
             restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
             reload_nginx_if_needed >/dev/null 2>&1 || true
@@ -1179,19 +1210,8 @@ edit_site() {
     else
         if ! render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port" || ! nginx_reload_safe; then
             rm -f "$(site_conf_path "$new_hostname")" "$(site_env_path "$new_hostname")"
-            cp "$old_site_backup" "$f" 2>/dev/null || true
-            if [ -f "$f" ]; then
-                R_HOSTNAME= R_TARGET= R_MODE= R_UPSTREAM_HOST= R_CUSTOM_HOST= R_LISTEN_PORT=
-                # shellcheck disable=SC1090
-                . "$f"
-                R_HOSTNAME="$HOSTNAME"
-                R_TARGET="$TARGET"
-                R_MODE="$MODE"
-                R_UPSTREAM_HOST="$UPSTREAM_HOST"
-                R_CUSTOM_HOST="$CUSTOM_HOST"
-                R_LISTEN_PORT="$LISTEN_PORT"
-                [ -n "$R_HOSTNAME" ] && render_site_nginx "$R_HOSTNAME" "$R_TARGET" "$R_MODE" "$R_UPSTREAM_HOST" "$R_CUSTOM_HOST" "$R_LISTEN_PORT" >/dev/null 2>&1 || true
-            fi
+            restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
+            reload_nginx_if_needed >/dev/null 2>&1 || true
             rm -f "$old_site_backup"
             err "Nginx 配置测试失败，已尝试回滚本次修改。"
             return 1

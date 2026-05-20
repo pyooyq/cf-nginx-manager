@@ -155,7 +155,7 @@ Account / Cloudflare Tunnel / Edit
 Zone / DNS / Edit
 ```
 
-如果你只用「Nginx 公网入站反代」模式，不需要管理 Tunnel，但申请证书仍然需要 `Zone / DNS / Edit`，因为脚本会用 DNS 验证申请 Let's Encrypt 证书。
+如果你只用「Nginx 公网入站反代」模式，不需要管理 Tunnel，但申请证书仍然需要 Cloudflare Account ID、Zone ID 和有 `Zone / DNS / Edit` 权限的 API Token，因为脚本会用 DNS 验证申请 Let's Encrypt 证书。
 
 资源范围建议只选你的账号和你的域名，不要给全局权限。
 
