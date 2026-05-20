@@ -50,7 +50,7 @@ Nginx 反代模式：
 
 - 安装 `nginx`、`curl`、`jq`、`cloudflared` 等依赖。
 - Alpine 3.21 默认仓库没有 `cloudflared` 时，自动添加 `edge/testing` 仓库安装。
-- 保存 Cloudflare API 信息和 Tunnel Token。
+- 保存 Cloudflare API 信息，并自动创建 Cloudflare Tunnel。
 - 创建 `cloudflared` 的 OpenRC 服务。
 - 设置 `nginx` 和 `cloudflared` 开机自启。
 
@@ -107,9 +107,9 @@ wget -O cf-nginx-manager.sh https://raw.githubusercontent.com/pyooyq/cf-nginx-ma
 Cloudflare Account ID
 Cloudflare Zone ID
 Cloudflare API Token
-Cloudflare Tunnel ID
-Cloudflare Tunnel Token
 ```
+
+脚本会用 API Token 自动创建 Cloudflare Tunnel，并保存 Tunnel ID 和 Tunnel Token。
 
 这些信息准备好后，脚本会保存到：
 
@@ -124,8 +124,9 @@ Cloudflare Tunnel Token
 你需要：
 
 1. 一个已经托管到 Cloudflare 的域名。
-2. 一个 Cloudflare Tunnel。
-3. 一个有权限操作 DNS 和 Tunnel 的 API Token。
+2. 一个有权限操作 DNS 和 Tunnel 的 API Token。
+
+每台 VPS 初始化时，脚本会自动创建一个独立的 Cloudflare Tunnel。不要在多台 VPS 上共用同一个 Tunnel Token，除非这些机器提供完全相同的服务和 Nginx 配置。
 
 ## 怎么获取 Account ID 和 Zone ID
 
@@ -160,25 +161,11 @@ Zone / DNS / Edit
 
 创建完成后复制 API Token。这个 Token 只显示一次，注意保存。
 
-## 怎么创建 Cloudflare Tunnel
+## Cloudflare Tunnel
 
-进入 Cloudflare Zero Trust：
+首次初始化时，脚本会通过 API 自动创建 Cloudflare Tunnel，并获取本机 `cloudflared` 服务需要的 Tunnel Token。
 
-```text
-Networks -> Tunnels -> Create a tunnel
-```
-
-选择 `cloudflared`。
-
-创建完成后你会看到安装命令，里面有一长串 token，例如：
-
-```text
-cloudflared tunnel run --token xxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-复制 `--token` 后面的完整内容，这就是 `Cloudflare Tunnel Token`。
-
-Tunnel ID 可以在 Tunnel 详情页看到，也可以从 Cloudflare 后台复制。
+默认每台 VPS 应该创建并使用自己的独立 Tunnel。Cloudflare 会把同一个 Tunnel Token 下的多台机器当成同一个入口池，如果这些机器的本地服务不同，公网访问可能会随机分配到错误机器并出现 `502 Bad Gateway`。
 
 ## 新增一个反代
 
@@ -375,7 +362,7 @@ curl -I https://app.example.com:52443/
 
 ## 安全说明
 
-脚本会保存 Cloudflare API Token 和 Tunnel Token，请只在你自己的 VPS 上运行。
+脚本会保存 Cloudflare API Token 和自动创建的 Tunnel Token，请只在你自己的 VPS 上运行。
 
 脚本只管理这些文件：
 

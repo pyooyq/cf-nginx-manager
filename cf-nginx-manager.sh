@@ -145,21 +145,54 @@ save_config() {
     mv "$tmp" "$CONFIG_ENV"
 }
 
+cloudflare_tunnel_token() {
+    tunnel_id="$1"
+    cf_api_request GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$tunnel_id/token" | jq -r '.result // empty'
+}
+
+create_cloudflare_tunnel() {
+    if [ -n "${CF_TUNNEL_ID:-}" ] && [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
+        say "沿用已保存的 Cloudflare Tunnel：$CF_TUNNEL_ID"
+        return 0
+    fi
+    if [ -n "${CF_TUNNEL_ID:-}" ]; then
+        say "获取已保存 Tunnel 的 Token：$CF_TUNNEL_ID"
+        CF_TUNNEL_TOKEN=$(cloudflare_tunnel_token "$CF_TUNNEL_ID") || return 1
+        if [ -n "$CF_TUNNEL_TOKEN" ]; then
+            return 0
+        fi
+        warn "无法获取已保存 Tunnel 的 Token，将创建新的 Tunnel。"
+        CF_TUNNEL_ID=""
+    fi
+
+    default_name="$APP_NAME-$(hostname 2>/dev/null || date +%s)"
+    tunnel_name=$(read_input "Cloudflare Tunnel 名称" "$default_name")
+    [ -n "$tunnel_name" ] || tunnel_name="$default_name"
+    body=$(jq -cn --arg name "$tunnel_name" '{name:$name,config_src:"cloudflare"}')
+    say "创建 Cloudflare Tunnel：$tunnel_name"
+    result=$(cf_api_request POST "/accounts/$CF_ACCOUNT_ID/cfd_tunnel" "$body") || return 1
+    CF_TUNNEL_ID=$(printf '%s' "$result" | jq -r '.result.id // empty')
+    if [ -z "$CF_TUNNEL_ID" ]; then
+        err "创建 Tunnel 失败，未返回 Tunnel ID。"
+        return 1
+    fi
+    CF_TUNNEL_TOKEN=$(cloudflare_tunnel_token "$CF_TUNNEL_ID") || return 1
+    if [ -z "$CF_TUNNEL_TOKEN" ]; then
+        err "获取 Tunnel Token 失败。请确认 API Token 具有 Account / Cloudflare Tunnel / Edit 权限。"
+        return 1
+    fi
+    say "Tunnel 已创建：$CF_TUNNEL_ID"
+}
+
 configure_credentials() {
     load_config
     old_api_token="${CF_API_TOKEN:-}"
-    old_tunnel_token="${CF_TUNNEL_TOKEN:-}"
-    say "请输入 Cloudflare API 与 Tunnel 信息。"
+    say "请输入 Cloudflare API 信息。"
     CF_ACCOUNT_ID=$(read_input "Cloudflare Account ID" "${CF_ACCOUNT_ID:-}")
     CF_ZONE_ID=$(read_input "Cloudflare Zone ID" "${CF_ZONE_ID:-}")
     CF_API_TOKEN=$(read_secret "Cloudflare API Token（输入不会回显，留空保留旧值）")
     if [ -z "$CF_API_TOKEN" ]; then
         CF_API_TOKEN="$old_api_token"
-    fi
-    CF_TUNNEL_ID=$(read_input "Cloudflare Tunnel ID" "${CF_TUNNEL_ID:-}")
-    CF_TUNNEL_TOKEN=$(read_secret "Cloudflare Tunnel Token（输入不会回显，留空保留旧值）")
-    if [ -z "$CF_TUNNEL_TOKEN" ]; then
-        CF_TUNNEL_TOKEN="$old_tunnel_token"
     fi
     LOCAL_SERVICE=$(read_input "本机 Nginx 服务地址" "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}")
     if confirm_default_no "是否启用 Nginx 上游 IPv6 解析？没有 IPv6 出口的 VPS 请保持关闭"; then
@@ -168,10 +201,11 @@ configure_credentials() {
         UPSTREAM_IPV6=0
     fi
 
-    if [ -z "$CF_ACCOUNT_ID" ] || [ -z "$CF_ZONE_ID" ] || [ -z "$CF_API_TOKEN" ] || [ -z "$CF_TUNNEL_ID" ] || [ -z "$CF_TUNNEL_TOKEN" ]; then
-        err "Account ID、Zone ID、API Token、Tunnel ID、Tunnel Token 都不能为空。"
+    if [ -z "$CF_ACCOUNT_ID" ] || [ -z "$CF_ZONE_ID" ] || [ -z "$CF_API_TOKEN" ]; then
+        err "Account ID、Zone ID、API Token 都不能为空。"
         return 1
     fi
+    create_cloudflare_tunnel || return 1
 
     save_config
     render_cloudflared_openrc
@@ -181,7 +215,7 @@ configure_credentials() {
 require_config() {
     load_config
     if [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${CF_ZONE_ID:-}" ] || [ -z "${CF_API_TOKEN:-}" ] || [ -z "${CF_TUNNEL_ID:-}" ] || [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
-        err "尚未配置 Cloudflare 信息，请先执行初始化或配置 Cloudflare 凭据。"
+        err "尚未完成 Cloudflare 配置，请先执行初始化或配置 Cloudflare 凭据。"
         return 1
     fi
 }
@@ -609,11 +643,14 @@ reload_nginx_if_needed() {
     fi
 }
 
-cf_api() {
+cf_api_request() {
     method="$1"
     path="$2"
     body="${3:-}"
-    require_config || return 1
+    if [ -z "${CF_API_TOKEN:-}" ]; then
+        err "Cloudflare API Token 不能为空。"
+        return 1
+    fi
     if [ -n "$body" ]; then
         curl -fsS -X "$method" "$CF_API_BASE$path" \
             -H "Authorization: Bearer $CF_API_TOKEN" \
@@ -624,6 +661,14 @@ cf_api() {
             -H "Authorization: Bearer $CF_API_TOKEN" \
             -H 'Content-Type: application/json'
     fi
+}
+
+cf_api() {
+    method="$1"
+    path="$2"
+    body="${3:-}"
+    require_config || return 1
+    cf_api_request "$method" "$path" "$body"
 }
 
 cf_dns_record_id() {
