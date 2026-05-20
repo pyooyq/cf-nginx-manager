@@ -89,7 +89,7 @@ Site `MODE` values drive both Cloudflare and Nginx behavior:
 - `proxy`: Tunnel points to local Nginx at `http://127.0.0.1:8080`; Nginx proxies to the target and can adjust Host/Cookie/redirect behavior.
 - `mirror`: Like `proxy`, plus `sub_filter` replacements for simple website mirroring.
 - `cfcdn`: Like Nginx proxy mode but keeps upstream Host/SNI oriented toward a target already behind Cloudflare CDN and disables upstream certificate verification.
-- `public`: Does not use Cloudflare Tunnel; Nginx listens on a user-selected HTTPS port, obtains a Let's Encrypt certificate through acme.sh Cloudflare DNS validation, and serves directly.
+- `public`: Does not use Cloudflare Tunnel; Nginx listens on a user-selected HTTPS port, creates/updates Cloudflare A and optional AAAA records, obtains a Let's Encrypt certificate through acme.sh Cloudflare DNS validation, and serves directly.
 
 ## README-derived user behavior
 

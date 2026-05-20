@@ -302,16 +302,20 @@ https://target.example.com
 
 - 不使用 Cloudflare Tunnel。
 - 让 Nginx 直接监听你输入的 HTTPS 端口，例如 `52443`。
+- 自动检测本机公网 IPv4，并创建或更新 Cloudflare A 记录。
+- 如果初始化时启用了 IPv6，可以选择检测并创建 AAAA 记录。
+- 可选择 DNS only 灰云或 Cloudflare 代理橙云；橙云只允许 Cloudflare 支持的 HTTPS 端口。
+- 如果已有 A/AAAA/CNAME 冲突记录，会提示确认是否覆盖。
 - 用 acme.sh 通过 Cloudflare DNS 验证申请 Let's Encrypt 证书。
 - 把证书安装到 `/etc/nginx/certs/<域名>/`。
 - 通过 cron 自动续签，续签后自动 reload Nginx。
 
 使用前你需要自己确认：
 
-- 域名已经解析到这台 VPS 的公网 IP。
 - VPS 防火墙和服务商安全组已经放行你输入的 TCP 端口。
 - Cloudflare Account ID、Zone ID 和 API Token 已配置，Token 至少有 `Zone / DNS / Edit` 权限。
-- 如果 DNS 开了 Cloudflare 橙云代理，端口要选 Cloudflare 支持的 HTTPS 端口；如果是灰云 DNS only，端口由你的 VPS 防火墙决定。
+- 如果选择 Cloudflare 橙云代理，端口必须是 Cloudflare 支持的 HTTPS 端口：`443`、`2053`、`2083`、`2087`、`2096`、`8443`。
+- 如果选择灰云 DNS only，端口由你的 VPS 防火墙和服务商安全组决定。
 
 访问地址会带端口，例如：
 

@@ -607,6 +607,41 @@ validate_port() {
     [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
+validate_ipv4() {
+    ip="$1"
+    case "$ip" in
+        ''|*[!0-9.]*) return 1 ;;
+    esac
+    old_ifs=$IFS
+    IFS=.
+    set -- $ip
+    IFS=$old_ifs
+    [ "$#" -eq 4 ] || return 1
+    for part do
+        case "$part" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$part" -ge 0 ] && [ "$part" -le 255 ] || return 1
+    done
+}
+
+validate_ipv6() {
+    ip="$1"
+    case "$ip" in
+        *:*) ;;
+        *) return 1 ;;
+    esac
+    case "$ip" in
+        ''|*[!0-9A-Fa-f:.]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+cloudflare_https_port_supported() {
+    case "$1" in
+        443|2053|2083|2087|2096|8443) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 validate_nginx_value() {
     value="$1"
     case "$value" in
@@ -861,9 +896,18 @@ cf_api() {
     cf_api_request "$method" "$path" "$body"
 }
 
+require_dns_config() {
+    load_config
+    if [ -z "${CF_ZONE_ID:-}" ] || [ -z "${CF_API_TOKEN:-}" ]; then
+        err "Cloudflare Zone ID 和 API Token 不能为空。"
+        return 1
+    fi
+}
+
 cf_dns_records() {
     hostname="$1"
-    response=$(cf_api GET "/zones/$CF_ZONE_ID/dns_records?name=$hostname") || return 1
+    require_dns_config || return 1
+    response=$(cf_api_request GET "/zones/$CF_ZONE_ID/dns_records?name=$hostname") || return 1
     cf_api_success "$response" || return 1
     printf '%s' "$response"
 }
@@ -912,6 +956,148 @@ cf_delete_dns() {
     else
         say "Cloudflare DNS 不存在，跳过：$hostname"
     fi
+}
+
+cf_dns_record_ids_by_type() {
+    hostname="$1"
+    record_type="$2"
+    response=$(cf_dns_records "$hostname") || return 1
+    printf '%s' "$response" | jq -r --arg type "$record_type" '.result[]? | select(.type == $type) | .id'
+}
+
+cf_delete_dns_record_id() {
+    record_id="$1"
+    response=$(cf_api_request DELETE "/zones/$CF_ZONE_ID/dns_records/$record_id") || return 1
+    cf_api_success "$response"
+}
+
+cf_delete_dns_type() {
+    hostname="$1"
+    record_type="$2"
+    ids=$(cf_dns_record_ids_by_type "$hostname" "$record_type") || return 1
+    [ -n "$ids" ] || return 0
+    printf '%s\n' "$ids" | while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        cf_delete_dns_record_id "$id" || exit 1
+    done
+}
+
+detect_public_ipv4() {
+    for url in https://api.ipify.org https://ifconfig.me/ip; do
+        ip=$(curl -4 -fsSL --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]') || true
+        if validate_ipv4 "$ip"; then
+            printf '%s' "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+detect_public_ipv6() {
+    for url in https://api6.ipify.org https://ifconfig.me/ip; do
+        ip=$(curl -6 -fsSL --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]') || true
+        if validate_ipv6 "$ip"; then
+            printf '%s' "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+choose_public_dns_settings() {
+    listen_port="$1"
+    old_proxied="${2:-0}"
+    old_ipv4="${3:-}"
+    old_ipv6="${4:-}"
+    printf '%s\n' "公网 DNS 模式：" >/dev/tty
+    printf '%s\n' "1) DNS only 灰云（推荐，端口不限）" >/dev/tty
+    printf '%s\n' "2) Cloudflare 代理橙云（仅限 Cloudflare 支持的 HTTPS 端口）" >/dev/tty
+    if [ "$old_proxied" = "1" ]; then default_choice=2; else default_choice=1; fi
+    printf '选择 [%s]: ' "$default_choice" >/dev/tty
+    IFS= read -r dns_choice </dev/tty
+    [ -n "$dns_choice" ] || dns_choice="$default_choice"
+    case "$dns_choice" in
+        2)
+            if ! cloudflare_https_port_supported "$listen_port"; then
+                err "Cloudflare 橙云 HTTPS 不支持端口 $listen_port。请改用灰云 DNS only，或使用 443/2053/2083/2087/2096/8443。"
+                return 1
+            fi
+            public_dns_proxied=1
+            ;;
+        *) public_dns_proxied=0 ;;
+    esac
+
+    detected_ipv4=$(detect_public_ipv4 || true)
+    default_ipv4="${old_ipv4:-$detected_ipv4}"
+    public_ipv4=$(read_input "公网 IPv4 A 记录" "$default_ipv4")
+    if ! validate_ipv4 "$public_ipv4"; then
+        err "公网 IPv4 不合法。"
+        return 1
+    fi
+
+    public_ipv6=""
+    if [ "$UPSTREAM_IPV6" = "1" ]; then
+        if [ -n "$old_ipv6" ]; then
+            use_ipv6_prompt="是否继续配置公网 IPv6 AAAA？"
+            use_ipv6=confirm_default_yes
+        else
+            use_ipv6_prompt="是否检测并配置公网 IPv6 AAAA？"
+            use_ipv6=confirm_default_no
+        fi
+        if $use_ipv6 "$use_ipv6_prompt"; then
+            detected_ipv6=$(detect_public_ipv6 || true)
+            default_ipv6="${old_ipv6:-$detected_ipv6}"
+            public_ipv6=$(read_input "公网 IPv6 AAAA 记录（留空跳过）" "$default_ipv6")
+            if [ -n "$public_ipv6" ] && ! validate_ipv6 "$public_ipv6"; then
+                err "公网 IPv6 不合法。"
+                return 1
+            fi
+        fi
+    fi
+}
+
+cf_upsert_public_dns() {
+    hostname="$1"
+    ipv4="$2"
+    ipv6="$3"
+    proxied="$4"
+    [ "$proxied" = "1" ] && proxied_json=true || proxied_json=false
+    response=$(cf_dns_records "$hostname") || return 1
+    conflicts=$(printf '%s' "$response" | jq -r --arg ipv4 "$ipv4" --arg ipv6 "$ipv6" --argjson proxied "$proxied_json" '
+        .result[]? |
+        select(
+            (.type == "CNAME") or
+            (.type == "A" and ((.content != $ipv4) or (.proxied != $proxied))) or
+            (.type == "AAAA" and (($ipv6 == "") or (.content != $ipv6) or (.proxied != $proxied)))
+        ) |
+        "\(.type) \(.name) -> \(.content) proxied=\(.proxied)"
+    ')
+    if [ -n "$conflicts" ]; then
+        err "Cloudflare DNS 存在将被覆盖的记录："
+        printf '%s\n' "$conflicts" >&2
+        confirm "是否覆盖这些 A/AAAA/CNAME 记录？" || return 1
+    fi
+    cf_delete_dns_type "$hostname" CNAME || return 1
+    cf_delete_dns_type "$hostname" A || return 1
+    cf_delete_dns_type "$hostname" AAAA || return 1
+    say "创建 Cloudflare DNS A：$hostname -> $ipv4"
+    body=$(jq -cn --arg type A --arg name "$hostname" --arg content "$ipv4" --argjson proxied "$proxied_json" '{type:$type,name:$name,content:$content,proxied:$proxied}')
+    response=$(cf_api_request POST "/zones/$CF_ZONE_ID/dns_records" "$body") || return 1
+    cf_api_success "$response" || return 1
+    if [ -n "$ipv6" ]; then
+        say "创建 Cloudflare DNS AAAA：$hostname -> $ipv6"
+        body=$(jq -cn --arg type AAAA --arg name "$hostname" --arg content "$ipv6" --argjson proxied "$proxied_json" '{type:$type,name:$name,content:$content,proxied:$proxied}')
+        response=$(cf_api_request POST "/zones/$CF_ZONE_ID/dns_records" "$body") || return 1
+        cf_api_success "$response" || return 1
+    fi
+}
+
+cf_delete_public_dns() {
+    hostname="$1"
+    require_dns_config || return 1
+    say "删除 Cloudflare 公网 DNS：$hostname"
+    cf_delete_dns_type "$hostname" A || return 1
+    cf_delete_dns_type "$hostname" AAAA || return 1
 }
 
 sync_managed_dns() {
@@ -1047,7 +1233,7 @@ choose_host_header() {
 restore_site_from_file() {
     backup_file="$1"
     [ -f "$backup_file" ] || return 1
-    HOSTNAME= TARGET= MODE= UPSTREAM_HOST= CUSTOM_HOST= LISTEN_PORT=
+    HOSTNAME= TARGET= MODE= UPSTREAM_HOST= CUSTOM_HOST= LISTEN_PORT= PUBLIC_DNS_PROXIED= PUBLIC_IPV4= PUBLIC_IPV6=
     # shellcheck disable=SC1090
     . "$backup_file"
     [ -n "$HOSTNAME" ] || return 1
@@ -1089,6 +1275,9 @@ add_site() {
     service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
     custom_host=""
     listen_port=""
+    public_dns_proxied=""
+    public_ipv4=""
+    public_ipv6=""
     if [ "$mode" = "direct" ]; then
         service="$target"
     elif [ "$mode" = "cfcdn" ]; then
@@ -1109,6 +1298,7 @@ add_site() {
             err "监听端口不合法。"
             return 1
         fi
+        choose_public_dns_settings "$listen_port" || return 1
         acme_email=$(read_input "ACME 账户邮箱（留空自动生成）" "")
         issue_cloudflare_cert "$hostname" "$acme_email" || return 1
         service=""
@@ -1117,7 +1307,7 @@ add_site() {
     fi
 
     backup_managed_files
-    save_site_env "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port"
+    save_site_env "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port" "$public_dns_proxied" "$public_ipv4" "$public_ipv6"
     if [ "$mode" = "direct" ]; then
         rm -f "$(site_conf_path "$hostname")"
     else
@@ -1128,8 +1318,13 @@ add_site() {
         fi
     fi
     if [ "$mode" = "public" ]; then
+        if ! cf_upsert_public_dns "$hostname" "$public_ipv4" "$public_ipv6" "$public_dns_proxied"; then
+            rollback_new_site "$hostname"
+            err "Cloudflare 公网 DNS 配置失败，已回滚本次新增。请检查 Cloudflare DNS 记录。"
+            return 1
+        fi
         say "新增完成：https://$hostname:$listen_port -> $target [public]"
-        say "请确认域名已解析到本机公网 IP，且防火墙/安全组已放行 TCP $listen_port。"
+        say "请确认防火墙/安全组已放行 TCP $listen_port。"
     else
         if ! cf_sync_ingress; then
             cf_delete_dns "$hostname" >/dev/null 2>&1 || true
@@ -1203,11 +1398,14 @@ edit_site() {
     load_config
     select_site_file || return 1
     f="$SELECTED_SITE_FILE"
-    HOSTNAME= TARGET= MODE= UPSTREAM_HOST= CUSTOM_HOST= LISTEN_PORT=
+    HOSTNAME= TARGET= MODE= UPSTREAM_HOST= CUSTOM_HOST= LISTEN_PORT= PUBLIC_DNS_PROXIED= PUBLIC_IPV4= PUBLIC_IPV6=
     # shellcheck disable=SC1090
     . "$f"
     old_hostname="$HOSTNAME"
     old_mode="$MODE"
+    old_public_dns_proxied="${PUBLIC_DNS_PROXIED:-0}"
+    old_public_ipv4="${PUBLIC_IPV4:-}"
+    old_public_ipv6="${PUBLIC_IPV6:-}"
     old_conf=$(site_conf_path "$old_hostname")
 
     new_hostname=$(read_input "公网域名" "$HOSTNAME")
@@ -1230,6 +1428,9 @@ edit_site() {
     service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
     custom_host=""
     listen_port=""
+    public_dns_proxied=""
+    public_ipv4=""
+    public_ipv6=""
     if [ "$mode" = "direct" ]; then
         service="$target"
     elif [ "$mode" = "cfcdn" ]; then
@@ -1250,6 +1451,7 @@ edit_site() {
             err "监听端口不合法。"
             return 1
         fi
+        choose_public_dns_settings "$listen_port" "${PUBLIC_DNS_PROXIED:-0}" "${PUBLIC_IPV4:-}" "${PUBLIC_IPV6:-}" || return 1
         if [ "$new_hostname" != "$old_hostname" ] || [ "$old_mode" != "public" ] || [ ! -s "$CERT_HOME/$new_hostname/fullchain.cer" ] || [ ! -s "$CERT_HOME/$new_hostname/private.key" ]; then
             acme_email=$(read_input "ACME 账户邮箱（留空自动生成）" "")
             issue_cloudflare_cert "$new_hostname" "$acme_email" || return 1
@@ -1265,7 +1467,7 @@ edit_site() {
     if [ "$new_hostname" != "$old_hostname" ]; then
         rm -f "$old_conf" "$f"
     fi
-    save_site_env "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port"
+    save_site_env "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port" "$public_dns_proxied" "$public_ipv4" "$public_ipv6"
     if [ "$mode" = "direct" ]; then
         rm -f "$(site_conf_path "$new_hostname")"
         if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ] || [ "$old_mode" = "public" ]; then
@@ -1299,26 +1501,44 @@ edit_site() {
         :
     fi
     if [ "$mode" = "public" ]; then
+        if ! cf_upsert_public_dns "$new_hostname" "$public_ipv4" "$public_ipv6" "$public_dns_proxied"; then
+            rm -f "$(site_conf_path "$new_hostname")" "$(site_env_path "$new_hostname")"
+            restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
+            reload_nginx_if_needed >/dev/null 2>&1 || true
+            rm -f "$old_site_backup"
+            err "Cloudflare 公网 DNS 配置失败，已尝试回滚本次修改。"
+            return 1
+        fi
         if [ "$old_mode" != "public" ]; then
             if ! cf_remove_ingress_hostname "$old_hostname" || ! cf_delete_dns "$old_hostname"; then
+                cf_delete_public_dns "$new_hostname" >/dev/null 2>&1 || true
                 rm -f "$(site_conf_path "$new_hostname")" "$(site_env_path "$new_hostname")"
                 restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
                 reload_nginx_if_needed >/dev/null 2>&1 || true
+                cf_sync_ingress >/dev/null 2>&1 || true
                 rm -f "$old_site_backup"
                 err "Cloudflare 旧入口清理失败，已尝试回滚本次修改。"
                 return 1
             fi
+        elif [ "$new_hostname" != "$old_hostname" ]; then
+            cf_delete_public_dns "$old_hostname" || warn "旧公网 DNS 删除失败：$old_hostname，请手动检查。"
         fi
         rm -f "$old_site_backup"
         say "修改完成：https://$new_hostname:$listen_port -> $target [public]"
-        say "请确认域名已解析到本机公网 IP，且防火墙/安全组已放行 TCP $listen_port。"
+        say "请确认防火墙/安全组已放行 TCP $listen_port。"
     else
+        if [ "$old_mode" = "public" ]; then
+            cf_delete_public_dns "$old_hostname" || warn "旧公网 DNS 删除失败：$old_hostname，请手动检查。"
+        fi
         if ! cf_sync_ingress; then
             cf_delete_dns "$new_hostname" >/dev/null 2>&1 || true
             cf_remove_ingress_hostname "$new_hostname" >/dev/null 2>&1 || true
             rm -f "$(site_conf_path "$new_hostname")" "$(site_env_path "$new_hostname")"
             restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
             reload_nginx_if_needed >/dev/null 2>&1 || true
+            if [ "$old_mode" = "public" ] && [ -n "$old_public_ipv4" ]; then
+                cf_upsert_public_dns "$old_hostname" "$old_public_ipv4" "$old_public_ipv6" "$old_public_dns_proxied" >/dev/null 2>&1 || true
+            fi
             rm -f "$old_site_backup"
             err "Cloudflare 同步失败，已尝试回滚本次修改。"
             return 1
@@ -1343,7 +1563,8 @@ delete_site() {
     old_mode="$MODE"
     say "将删除：$HOSTNAME -> $TARGET"
     if [ "$old_mode" = "public" ]; then
-        confirm "确认删除该公网入站反代？证书文件会保留。" || return 0
+        require_cf_api_token || return 1
+        confirm "确认删除该公网入站反代及 Cloudflare A/AAAA DNS？证书文件会保留。" || return 0
     else
         require_config || return 1
         confirm "确认删除该反代及 Cloudflare DNS/ingress？" || return 0
@@ -1352,6 +1573,8 @@ delete_site() {
     if [ "$old_mode" != "public" ]; then
         cf_remove_ingress_hostname "$HOSTNAME" || return 1
         cf_delete_dns "$HOSTNAME" || return 1
+    else
+        cf_delete_public_dns "$HOSTNAME" || return 1
     fi
     rm -f "$(site_conf_path "$HOSTNAME")" "$f"
     if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ] || [ "$old_mode" = "public" ]; then
