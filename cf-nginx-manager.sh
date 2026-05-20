@@ -77,7 +77,7 @@ read_secret() {
     printf '%s' "$value"
 }
 
-confirm() {
+confirm_default_no() {
     prompt="$1"
     printf '%s [y/N]: ' "$prompt" >/dev/tty
     IFS= read -r answer </dev/tty
@@ -85,6 +85,10 @@ confirm() {
         y|Y|yes|YES) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+confirm() {
+    confirm_default_no "$1"
 }
 
 shell_quote() {
@@ -119,6 +123,10 @@ load_config() {
         . "$CONFIG_ENV"
     fi
     LOCAL_SERVICE="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
+    case "${UPSTREAM_IPV6:-0}" in
+        1|true|TRUE|yes|YES|on|ON) UPSTREAM_IPV6=1 ;;
+        *) UPSTREAM_IPV6=0 ;;
+    esac
 }
 
 save_config() {
@@ -131,6 +139,7 @@ save_config() {
         printf 'CF_TUNNEL_ID=%s\n' "$(shell_quote "${CF_TUNNEL_ID:-}")"
         printf 'CF_TUNNEL_TOKEN=%s\n' "$(shell_quote "${CF_TUNNEL_TOKEN:-}")"
         printf 'LOCAL_SERVICE=%s\n' "$(shell_quote "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}")"
+        printf 'UPSTREAM_IPV6=%s\n' "$(shell_quote "${UPSTREAM_IPV6:-0}")"
     } > "$tmp"
     chmod 600 "$tmp"
     mv "$tmp" "$CONFIG_ENV"
@@ -153,6 +162,11 @@ configure_credentials() {
         CF_TUNNEL_TOKEN="$old_tunnel_token"
     fi
     LOCAL_SERVICE=$(read_input "本机 Nginx 服务地址" "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}")
+    if confirm_default_no "是否启用 Nginx 上游 IPv6 解析？没有 IPv6 出口的 VPS 请保持关闭"; then
+        UPSTREAM_IPV6=1
+    else
+        UPSTREAM_IPV6=0
+    fi
 
     if [ -z "$CF_ACCOUNT_ID" ] || [ -z "$CF_ZONE_ID" ] || [ -z "$CF_API_TOKEN" ] || [ -z "$CF_TUNNEL_ID" ] || [ -z "$CF_TUNNEL_TOKEN" ]; then
         err "Account ID、Zone ID、API Token、Tunnel ID、Tunnel Token 都不能为空。"
@@ -480,7 +494,11 @@ render_site_nginx() {
             printf '    ssl_protocols TLSv1.2 TLSv1.3;\n'
             printf '    ssl_prefer_server_ciphers off;\n\n'
         fi
-        printf '    resolver 1.1.1.1 8.8.8.8 ipv6=off valid=300s;\n'
+        if [ "$UPSTREAM_IPV6" = "1" ]; then
+            printf '    resolver 1.1.1.1 8.8.8.8 ipv6=on valid=300s;\n'
+        else
+            printf '    resolver 1.1.1.1 8.8.8.8 ipv6=off valid=300s;\n'
+        fi
         printf '    resolver_timeout 5s;\n\n'
         printf '    client_max_body_size 100m;\n'
         printf '    proxy_buffers 8 16k;\n'
@@ -1239,6 +1257,7 @@ show_current_config() {
     load_config
     say "配置目录：$CONFIG_DIR"
     say "本地服务：${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
+    if [ "${UPSTREAM_IPV6:-0}" = "1" ]; then say "上游 IPv6：启用"; else say "上游 IPv6：关闭"; fi
     say "Account ID：${CF_ACCOUNT_ID:-未配置}"
     say "Zone ID：${CF_ZONE_ID:-未配置}"
     say "Tunnel ID：${CF_TUNNEL_ID:-未配置}"
