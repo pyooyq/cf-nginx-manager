@@ -719,6 +719,19 @@ render_site_nginx() {
 
     tmp="$conf.tmp"
     {
+        if [ "$mode" = "public" ]; then
+            if [ "$listen_port" = "443" ]; then
+                public_redirect_base="https://$hostname"
+            else
+                public_redirect_base="https://$hostname:$listen_port"
+            fi
+            printf 'server {\n'
+            printf '    listen %s;\n' "$listen_port"
+            printf '    listen [::]:%s;\n' "$listen_port"
+            printf '    server_name %s;\n\n' "$hostname"
+            printf '    return 301 %s$request_uri;\n' "$public_redirect_base"
+            printf '}\n\n'
+        fi
         printf 'server {\n'
         if [ "$mode" = "public" ]; then
             printf '    listen %s ssl;\n' "$listen_port"

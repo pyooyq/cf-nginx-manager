@@ -301,7 +301,8 @@ https://target.example.com
 这个模式会：
 
 - 不使用 Cloudflare Tunnel。
-- 让 Nginx 直接监听你输入的 HTTPS 端口，例如 `52443`。
+- 让 Nginx 直接监听你输入的公网端口，例如 `52443`。
+- 同一端口的 HTTP 访问会自动 301 跳转到 HTTPS。
 - 自动检测本机公网 IPv4，并创建或更新 Cloudflare A 记录。
 - 如果初始化时启用了 IPv6，可以选择检测并创建 AAAA 记录。
 - 可选择 DNS only 灰云或 Cloudflare 代理橙云；橙云只允许 Cloudflare 支持的 HTTPS 端口。
