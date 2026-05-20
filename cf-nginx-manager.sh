@@ -233,9 +233,21 @@ save_config() {
 }
 
 print_token_permission_requirements() {
-    err "Cloudflare API Token 权限不足，无法自动查询 Zone ID / Account ID。"
-    err "请创建或调整 Token 权限：Zone / Zone / Read，Zone / DNS / Edit。"
-    err "如果需要自动创建或同步 Tunnel，还需要 Cloudflare Tunnel 相关 Account 权限。"
+    err "Cloudflare API Token 无法自动查询 Zone ID / Account ID。"
+    err "自动查询 Zone ID 需要：Zone / Zone / Read。"
+    err "管理 DNS 和申请证书需要：Zone / DNS / Edit。"
+    err "如果需要自动创建或同步 Tunnel，还需要：Account / Cloudflare Tunnel / Edit。"
+    err "如果需要通过 /accounts 兜底查询账号列表，还需要：Account / Account Settings / Read。"
+}
+
+manual_cloudflare_ids_fallback() {
+    warn "将改为手动输入 Cloudflare Account ID 和 Zone ID。"
+    CF_ACCOUNT_ID=$(read_input "Cloudflare Account ID" "${CF_ACCOUNT_ID:-}")
+    CF_ZONE_ID=$(read_input "Cloudflare Zone ID" "${CF_ZONE_ID:-}")
+    if [ -z "$CF_ACCOUNT_ID" ] || [ -z "$CF_ZONE_ID" ]; then
+        err "Account ID 和 Zone ID 都不能为空。"
+        exit 1
+    fi
 }
 
 select_cloudflare_result_index() {
@@ -268,29 +280,47 @@ select_cloudflare_result_index() {
 
 discover_cloudflare_ids() {
     printf '%s\n' "正在通过 API Token 查询 Cloudflare Zone ID..." >/dev/tty
-    zones_response=$(cf_api_request GET "/zones") || { print_token_permission_requirements; exit 1; }
+    zones_response=$(cf_api_request GET "/zones") || {
+        print_token_permission_requirements
+        manual_cloudflare_ids_fallback
+        return 0
+    }
     if ! cf_api_success "$zones_response"; then
         print_token_permission_requirements
-        exit 1
+        manual_cloudflare_ids_fallback
+        return 0
     fi
-    zone_idx=$(select_cloudflare_result_index "Cloudflare Zone" "$zones_response") || exit 1
+    zone_idx=$(select_cloudflare_result_index "Cloudflare Zone" "$zones_response") || {
+        print_token_permission_requirements
+        manual_cloudflare_ids_fallback
+        return 0
+    }
     CF_ZONE_ID=$(printf '%s' "$zones_response" | jq -r ".result[$zone_idx].id // empty")
     CF_ACCOUNT_ID=$(printf '%s' "$zones_response" | jq -r ".result[$zone_idx].account.id // empty")
 
     if [ -z "$CF_ACCOUNT_ID" ]; then
         printf '%s\n' "Zone 响应中没有 Account ID，尝试查询 Cloudflare Account ID..." >/dev/tty
-        accounts_response=$(cf_api_request GET "/accounts") || { print_token_permission_requirements; exit 1; }
+        accounts_response=$(cf_api_request GET "/accounts") || {
+            print_token_permission_requirements
+            manual_cloudflare_ids_fallback
+            return 0
+        }
         if ! cf_api_success "$accounts_response"; then
             print_token_permission_requirements
-            exit 1
+            manual_cloudflare_ids_fallback
+            return 0
         fi
-        account_idx=$(select_cloudflare_result_index "Cloudflare Account" "$accounts_response") || exit 1
+        account_idx=$(select_cloudflare_result_index "Cloudflare Account" "$accounts_response") || {
+            print_token_permission_requirements
+            manual_cloudflare_ids_fallback
+            return 0
+        }
         CF_ACCOUNT_ID=$(printf '%s' "$accounts_response" | jq -r ".result[$account_idx].id // empty")
     fi
 
     if [ -z "$CF_ZONE_ID" ] || [ -z "$CF_ACCOUNT_ID" ]; then
-        err "未能自动获取 Zone ID 或 Account ID。"
-        exit 1
+        print_token_permission_requirements
+        manual_cloudflare_ids_fallback
     fi
 }
 

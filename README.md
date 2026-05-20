@@ -49,8 +49,8 @@ Nginx 反代模式：
 首次运行可以自动：
 
 - 安装 `nginx`、`curl`、`jq`、`cloudflared` 等依赖。
-- Alpine 3.21 默认仓库没有 `cloudflared` 时，自动添加 `edge/testing` 仓库安装。
-- 保存 Cloudflare API 信息，并自动创建 Cloudflare Tunnel。
+- Alpine 3.21 默认仓库没有 `cloudflared` 时，临时使用 `edge/testing` 仓库安装。
+- 保存 Cloudflare API Token，自动查询 Account ID / Zone ID，并可自动创建 Cloudflare Tunnel。
 - 创建 `cloudflared` 的 OpenRC 服务。
 - 设置 `nginx` 和 `cloudflared` 开机自启。
 
@@ -104,13 +104,11 @@ wget -O cf-nginx-manager.sh https://raw.githubusercontent.com/pyooyq/cf-nginx-ma
 1) 首次初始化 / 修复环境
 ```
 
-然后脚本会逐项提示你输入 Cloudflare 信息，例如 `Cloudflare Account ID:`、`Cloudflare Zone ID:`。如果看到这些提示，就按提示粘贴对应内容后回车。
+然后脚本会提示你输入 Cloudflare API Token，并通过 Cloudflare API 自动查询 Account ID 和 Zone ID。正常情况下不需要手动填写 ID；如果 Token 权限太窄或 Cloudflare API 返回中缺少账号信息，脚本会提示原因并让你手动输入 Account ID / Zone ID 兜底。
 
-需要准备这些东西：
+需要准备：
 
 ```text
-Cloudflare Account ID
-Cloudflare Zone ID
 Cloudflare API Token
 ```
 
@@ -147,15 +145,18 @@ cfp
 
 每台 VPS 建议创建并使用自己的独立 Cloudflare Tunnel。配置时如果已有 Tunnel，脚本会让你选择“创建新的独立 Tunnel”或“沿用当前 Tunnel”。不要在多台 VPS 上共用同一个 Tunnel Token，除非这些机器提供完全相同的服务和 Nginx 配置。
 
-## 怎么获取 Account ID 和 Zone ID
+## Account ID 和 Zone ID
 
-打开 Cloudflare 网站：
+脚本会优先通过 `GET /zones` 自动查询 Zone ID，并从返回的 `account.id` 自动取得 Account ID。Cloudflare 官方的 Zone 列表响应包含 zone 所属账号信息，所以大多数情况下只需要 API Token。
 
-1. 进入你的域名。
-2. 右侧边栏可以看到：
-   - `Account ID`
-   - `Zone ID`
-3. 复制下来，后面脚本会用到。
+如果自动查询失败，或者 Token 没有足够权限读取账号列表，脚本会让你手动输入：
+
+```text
+Cloudflare Account ID
+Cloudflare Zone ID
+```
+
+你可以在 Cloudflare 网站进入对应域名后，从右侧边栏复制这两个 ID。
 
 ## 怎么创建 API Token
 
@@ -167,14 +168,28 @@ My Profile -> API Tokens -> Create Token
 
 可以选择自定义 Token。
 
-需要给这些权限：
+推荐给这些权限：
 
 ```text
-Account / Cloudflare Tunnel / Edit
-Zone / DNS / Edit
+账户 / Cloudflare Tunnel / 编辑
+账户 / 账户设置 / 读取
+区域 / 区域 / 读取
+区域 / DNS / 编辑
 ```
 
-如果你只用「Nginx 公网入站反代」模式，不需要管理 Tunnel，但申请证书仍然需要 Cloudflare Account ID、Zone ID 和有 `Zone / DNS / Edit` 权限的 API Token，因为脚本会用 DNS 验证申请 Let's Encrypt 证书。
+权限用途：
+
+- `区域 / 区域 / 读取`：脚本调用 `GET /zones` 自动查询 Zone ID，并从 zone 返回里的 `account.id` 获取 Account ID。
+- `区域 / DNS / 编辑`：创建、修改、删除 DNS 记录；公网入站反代申请 Let's Encrypt 证书时也需要 DNS 验证。
+- `账户 / Cloudflare Tunnel / 编辑`：创建 Cloudflare Tunnel、获取 Tunnel Token、同步 Tunnel ingress。只使用「Nginx 公网入站反代」模式时可以不配置这个权限。
+- `账户 / 账户设置 / 读取`：用于脚本在 zone 响应缺少 `account.id` 时调用 `/accounts` 兜底查询账号列表。部分只授予区域权限的 Token 不能列出账号，所以没有这个权限时可能查不到 Account ID；脚本会改为让你手动输入 Account ID / Zone ID。
+
+如果你只用「Nginx 公网入站反代」模式，最小权限是：
+
+```text
+区域 / 区域 / 读取
+区域 / DNS / 编辑
+```
 
 资源范围建议只选你的账号和你的域名，不要给全局权限。
 
