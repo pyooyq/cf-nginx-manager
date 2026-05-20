@@ -112,6 +112,10 @@ json_escape() {
     jq -Rn --arg v "$1" '$v'
 }
 
+url_encode() {
+    jq -nr --arg v "$1" '$v|@uri'
+}
+
 safe_host() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g; s/[.]/_/g'
 }
@@ -331,10 +335,43 @@ cloudflare_tunnel_token() {
     printf '%s' "$response" | jq -r '.result // empty'
 }
 
+cloudflare_tunnel_delete() {
+    tunnel_id="$1"
+    response=$(cf_api_request DELETE "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$tunnel_id") || return 1
+    cf_api_success "$response"
+}
+
+cloudflare_tunnel_id_by_name() {
+    tunnel_name="$1"
+    tunnel_name_query=$(url_encode "$tunnel_name")
+    response=$(cf_api_request GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel?name=$tunnel_name_query&is_deleted=false") || return 1
+    cf_api_success "$response" || return 1
+    printf '%s' "$response" | jq -r --arg name "$tunnel_name" '.result[]? | select(.name == $name) | .id' | head -n 1
+}
+
+use_existing_cloudflare_tunnel() {
+    tunnel_id="$1"
+    tunnel_token=$(cloudflare_tunnel_token "$tunnel_id") || return 1
+    [ -n "$tunnel_token" ] || return 1
+    CF_TUNNEL_ID="$tunnel_id"
+    CF_TUNNEL_TOKEN="$tunnel_token"
+    say "已复用 Cloudflare Tunnel：$CF_TUNNEL_ID"
+}
+
 create_new_cloudflare_tunnel() {
     default_name="$APP_NAME-$(hostname 2>/dev/null || date +%s)"
     tunnel_name=$(read_input "Cloudflare Tunnel 名称" "$default_name")
     [ -n "$tunnel_name" ] || tunnel_name="$default_name"
+    existing_tunnel_id=$(cloudflare_tunnel_id_by_name "$tunnel_name" || true)
+    if [ -n "$existing_tunnel_id" ]; then
+        warn "已存在同名 Cloudflare Tunnel：$tunnel_name [$existing_tunnel_id]"
+        if confirm_default_yes "是否复用这个 Tunnel？"; then
+            use_existing_cloudflare_tunnel "$existing_tunnel_id" || return 1
+            return 0
+        fi
+        tunnel_name=$(read_input "新的 Cloudflare Tunnel 名称" "$tunnel_name-$(date +%s)")
+        [ -n "$tunnel_name" ] || return 1
+    fi
     body=$(jq -cn --arg name "$tunnel_name" '{name:$name,config_src:"cloudflare"}')
     say "创建 Cloudflare Tunnel：$tunnel_name"
     result=$(cf_api_request POST "/accounts/$CF_ACCOUNT_ID/cfd_tunnel" "$body") || return 1
@@ -1824,17 +1861,24 @@ uninstall_manager() {
     ui_section "默认不会删除"
     printf '  - nginx / cloudflared 软件包（后续可选择卸载）\n'
     printf '  - Cloudflare 后台已经存在的 DNS 记录\n'
-    printf '  - Cloudflare Tunnel 远端配置\n'
+    printf '  - Cloudflare Tunnel 远端配置（后续可选择删除）\n'
     printf '  - %s 下的其他证书目录\n' "$CERT_HOME"
     printf '\n'
+    load_config
     confirm "确认卸载本机 $APP_NAME 管理文件？" || return 0
     remove_nginx=0
     remove_cloudflared=0
+    remove_remote_tunnel=0
     if confirm_default_no "是否同时卸载 nginx 软件包？"; then
         remove_nginx=1
     fi
     if confirm_default_no "是否同时卸载 cloudflared 软件包？"; then
         remove_cloudflared=1
+    fi
+    if [ -n "${CF_TUNNEL_ID:-}" ]; then
+        if confirm_default_no "是否同时删除 Cloudflare Tunnel 远端配置：$CF_TUNNEL_ID？"; then
+            remove_remote_tunnel=1
+        fi
     fi
     confirm "再次确认：继续删除这些本地文件？" || return 0
 
@@ -1843,6 +1887,10 @@ uninstall_manager() {
     copy_existing_files "$uninstall_backup/nginx" "$NGINX_MAP_FILE" "$NGINX_PREFIX"*.conf
     copy_existing_files "$uninstall_backup/sites" "$SITES_DIR"/*.env
     copy_existing_files "$uninstall_backup" "$CONFIG_ENV"
+    if [ "$remove_remote_tunnel" = 1 ]; then
+        say "删除 Cloudflare Tunnel 远端配置：$CF_TUNNEL_ID"
+        cloudflare_tunnel_delete "$CF_TUNNEL_ID" || warn "Cloudflare Tunnel 远端配置删除失败，请手动检查：$CF_TUNNEL_ID"
+    fi
     rc-service cloudflared stop >/dev/null 2>&1 || true
     rc-update del cloudflared default >/dev/null 2>&1 || true
     if [ "$remove_nginx" = 1 ]; then
