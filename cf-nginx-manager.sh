@@ -232,6 +232,60 @@ save_config() {
     mv "$tmp" "$CONFIG_ENV"
 }
 
+print_token_permission_requirements() {
+    err "Cloudflare API Token 权限不足，无法自动查询 Account ID / Zone ID。"
+    err "请创建或调整 Token 权限：Account / Account Settings / Read，Zone / Zone / Read，Zone / DNS / Edit。"
+    err "如果需要自动创建或同步 Tunnel，还需要 Cloudflare Tunnel 相关 Account 权限。"
+}
+
+select_cloudflare_result() {
+    title="$1"
+    response="$2"
+    field="$3"
+    count=$(printf '%s' "$response" | jq '.result | length') || return 1
+    if [ "$count" -eq 0 ]; then
+        err "未找到可用的 $title。"
+        return 1
+    fi
+    if [ "$count" -eq 1 ]; then
+        printf '%s' "$response" | jq -r ".result[0].$field"
+        return 0
+    fi
+
+    printf '%s\n' "检测到多个 $title，请选择：" >/dev/tty
+    printf '%s' "$response" | jq -r '.result | to_entries[] | "\(.key + 1)) \(.value.name) [\(.value.id)]"' >/dev/tty
+    while :; do
+        choice=$(read_input "$title 编号" "1")
+        case "$choice" in
+            ''|*[!0-9]*) warn "请输入数字编号。"; continue ;;
+        esac
+        if [ "$choice" -ge 1 ] && [ "$choice" -le "$count" ]; then
+            idx=$((choice - 1))
+            printf '%s' "$response" | jq -r ".result[$idx].$field"
+            return 0
+        fi
+        warn "编号超出范围。"
+    done
+}
+
+discover_cloudflare_ids() {
+    printf '%s\n' "正在通过 API Token 查询 Cloudflare Account ID..." >/dev/tty
+    accounts_response=$(cf_api_request GET "/accounts") || { print_token_permission_requirements; exit 1; }
+    if ! cf_api_success "$accounts_response"; then
+        print_token_permission_requirements
+        exit 1
+    fi
+    CF_ACCOUNT_ID=$(select_cloudflare_result "Cloudflare Account" "$accounts_response" id) || exit 1
+
+    printf '%s\n' "正在通过 API Token 查询 Cloudflare Zone ID..." >/dev/tty
+    zones_response=$(cf_api_request GET "/zones") || { print_token_permission_requirements; exit 1; }
+    if ! cf_api_success "$zones_response"; then
+        print_token_permission_requirements
+        exit 1
+    fi
+    CF_ZONE_ID=$(select_cloudflare_result "Cloudflare Zone" "$zones_response" id) || exit 1
+}
+
 cloudflare_tunnel_token() {
     tunnel_id="$1"
     response=$(cf_api_request GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$tunnel_id/token") || return 1
@@ -293,13 +347,16 @@ configure_credentials() {
     need_root
     load_config
     old_api_token="${CF_API_TOKEN:-}"
-    say "请输入 Cloudflare API 信息。"
-    CF_ACCOUNT_ID=$(read_input "Cloudflare Account ID" "${CF_ACCOUNT_ID:-}")
-    CF_ZONE_ID=$(read_input "Cloudflare Zone ID" "${CF_ZONE_ID:-}")
+    say "请输入 Cloudflare API Token，脚本会自动查询 Account ID 和 Zone ID。"
     CF_API_TOKEN=$(read_secret "Cloudflare API Token（输入不会回显，留空保留旧值）")
     if [ -z "$CF_API_TOKEN" ]; then
         CF_API_TOKEN="$old_api_token"
     fi
+    if [ -z "$CF_API_TOKEN" ]; then
+        err "Cloudflare API Token 不能为空。"
+        exit 1
+    fi
+    discover_cloudflare_ids
     LOCAL_SERVICE=$(read_input "本机 Nginx 服务地址" "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}")
     if confirm_default_no "是否启用 Nginx 上游 IPv6 解析？没有 IPv6 出口的 VPS 请保持关闭"; then
         UPSTREAM_IPV6=1
@@ -307,9 +364,9 @@ configure_credentials() {
         UPSTREAM_IPV6=0
     fi
 
-    if [ -z "$CF_ACCOUNT_ID" ] || [ -z "$CF_ZONE_ID" ] || [ -z "$CF_API_TOKEN" ]; then
-        err "Account ID、Zone ID、API Token 都不能为空。"
-        return 1
+    if [ -z "$CF_ACCOUNT_ID" ] || [ -z "$CF_ZONE_ID" ]; then
+        err "未能自动获取 Account ID 或 Zone ID。"
+        exit 1
     fi
     if confirm_default_yes "是否配置 Cloudflare Tunnel？只使用公网入站反代可选否"; then
         configure_cloudflare_tunnel || return 1
@@ -336,22 +393,18 @@ require_config() {
 require_cf_api_token() {
     load_config
     changed=0
-    if [ -z "${CF_ACCOUNT_ID:-}" ]; then
-        CF_ACCOUNT_ID=$(read_input "Cloudflare Account ID" "")
-        changed=1
-    fi
-    if [ -z "${CF_ZONE_ID:-}" ]; then
-        CF_ZONE_ID=$(read_input "Cloudflare Zone ID" "")
-        changed=1
-    fi
     if [ -z "${CF_API_TOKEN:-}" ]; then
-        say "公网入站反代申请证书需要 Cloudflare API Token（至少 Zone / DNS / Edit 权限）。"
+        say "公网入站反代申请证书需要 Cloudflare API Token。"
         CF_API_TOKEN=$(read_secret "Cloudflare API Token（输入不会回显）")
         changed=1
     fi
-    if [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${CF_ZONE_ID:-}" ] || [ -z "${CF_API_TOKEN:-}" ]; then
-        err "Account ID、Zone ID、API Token 都不能为空。"
-        return 1
+    if [ -z "${CF_API_TOKEN:-}" ]; then
+        err "Cloudflare API Token 不能为空。"
+        exit 1
+    fi
+    if [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${CF_ZONE_ID:-}" ]; then
+        discover_cloudflare_ids
+        changed=1
     fi
     if [ "$changed" = 1 ]; then
         save_config
@@ -747,6 +800,7 @@ render_site_nginx() {
     fi
     host_header="$upstream_host"
     cert_dir="$CERT_HOME/$hostname"
+    ssl_cache_zone="cf_nginx_ssl_$(safe_host "$hostname")"
     [ -n "$custom_host" ] && host_header="$custom_host"
 
     tmp="$conf.tmp"
@@ -775,7 +829,7 @@ render_site_nginx() {
         if [ "$mode" = "public" ]; then
             printf '    ssl_certificate     %s/fullchain.cer;\n' "$cert_dir"
             printf '    ssl_certificate_key %s/private.key;\n' "$cert_dir"
-            printf '    ssl_session_cache shared:SSL:10m;\n'
+            printf '    ssl_session_cache shared:%s:10m;\n' "$ssl_cache_zone"
             printf '    ssl_session_timeout 10m;\n'
             printf '    ssl_protocols TLSv1.2 TLSv1.3;\n'
             printf '    ssl_prefer_server_ciphers off;\n\n'
