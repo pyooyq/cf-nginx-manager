@@ -1293,19 +1293,39 @@ cf_upsert_public_dns() {
         err "Cloudflare DNS 存在将被覆盖的记录："
         printf '%s\n' "$conflicts" >&2
         confirm "是否覆盖这些 A/AAAA/CNAME 记录？" || return 1
+        conflict_ids=$(printf '%s' "$response" | jq -r --arg ipv4 "$ipv4" --arg ipv6 "$ipv6" --argjson proxied "$proxied_json" '
+            .result[]? |
+            select(
+                (.type == "CNAME") or
+                (.type == "A" and ((.content != $ipv4) or (.proxied != $proxied))) or
+                (.type == "AAAA" and (($ipv6 == "") or (.content != $ipv6) or (.proxied != $proxied)))
+            ) |
+            .id
+        ')
+        cf_delete_dns_record_ids "$conflict_ids" || return 1
+        response=$(cf_dns_records "$hostname") || return 1
     fi
-    cf_delete_dns_type "$hostname" CNAME || return 1
-    cf_delete_dns_type "$hostname" A || return 1
-    cf_delete_dns_type "$hostname" AAAA || return 1
-    say "创建 Cloudflare DNS A：$hostname -> $ipv4"
-    body=$(jq -cn --arg type A --arg name "$hostname" --arg content "$ipv4" --argjson proxied "$proxied_json" '{type:$type,name:$name,content:$content,proxied:$proxied}')
-    response=$(cf_api_request POST "/zones/$CF_ZONE_ID/dns_records" "$body") || return 1
-    cf_api_success "$response" || return 1
+
+    a_id=$(printf '%s' "$response" | jq -r --arg ipv4 "$ipv4" --argjson proxied "$proxied_json" '.result[]? | select(.type == "A" and .content == $ipv4 and .proxied == $proxied) | .id' | head -n 1)
+    if [ -n "$a_id" ]; then
+        say "Cloudflare DNS A 已存在，跳过：$hostname -> $ipv4"
+    else
+        say "创建 Cloudflare DNS A：$hostname -> $ipv4"
+        body=$(jq -cn --arg type A --arg name "$hostname" --arg content "$ipv4" --argjson proxied "$proxied_json" '{type:$type,name:$name,content:$content,proxied:$proxied}')
+        create_response=$(cf_api_request POST "/zones/$CF_ZONE_ID/dns_records" "$body") || return 1
+        cf_api_success "$create_response" || return 1
+    fi
+
     if [ -n "$ipv6" ]; then
-        say "创建 Cloudflare DNS AAAA：$hostname -> $ipv6"
-        body=$(jq -cn --arg type AAAA --arg name "$hostname" --arg content "$ipv6" --argjson proxied "$proxied_json" '{type:$type,name:$name,content:$content,proxied:$proxied}')
-        response=$(cf_api_request POST "/zones/$CF_ZONE_ID/dns_records" "$body") || return 1
-        cf_api_success "$response" || return 1
+        aaaa_id=$(printf '%s' "$response" | jq -r --arg ipv6 "$ipv6" --argjson proxied "$proxied_json" '.result[]? | select(.type == "AAAA" and .content == $ipv6 and .proxied == $proxied) | .id' | head -n 1)
+        if [ -n "$aaaa_id" ]; then
+            say "Cloudflare DNS AAAA 已存在，跳过：$hostname -> $ipv6"
+        else
+            say "创建 Cloudflare DNS AAAA：$hostname -> $ipv6"
+            body=$(jq -cn --arg type AAAA --arg name "$hostname" --arg content "$ipv6" --argjson proxied "$proxied_json" '{type:$type,name:$name,content:$content,proxied:$proxied}')
+            create_response=$(cf_api_request POST "/zones/$CF_ZONE_ID/dns_records" "$body") || return 1
+            cf_api_success "$create_response" || return 1
+        fi
     fi
 }
 
