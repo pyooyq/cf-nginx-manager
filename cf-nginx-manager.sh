@@ -312,7 +312,7 @@ target_scheme() {
 }
 
 target_authority() {
-    printf '%s' "$1" | sed 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/.*##'
+    printf '%s' "$1" | sed 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||; s|[/?#].*||'
 }
 
 target_host_only() {
@@ -324,8 +324,15 @@ target_host_only() {
 }
 
 target_path_prefix() {
-    path=$(printf '%s' "$1" | sed 's#^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]*##')
+    path=$(printf '%s' "$1" | sed 's|^[a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]*||; s|[?#].*||')
     [ -n "$path" ] || path="/"
+    while [ "$path" != "/" ]; do
+        case "$path" in
+            */) path=${path%/} ;;
+            *) break ;;
+        esac
+    done
+    [ "$path" = "/" ] && path=""
     printf '%s' "$path"
 }
 
@@ -389,15 +396,25 @@ validate_port() {
 validate_nginx_value() {
     value="$1"
     case "$value" in
-        ''|*' '*|*';'*|*'{'*|*'}'*|*'`'*|*'$('*|*'\n'*|*'\r'*) return 1 ;;
+        ''|*' '*|*';'*|*'{'*|*'}'*|*'`'*|*'$'*|*'"'*|*'\\'*|*'\n'*|*'\r'*) return 1 ;;
         *) return 0 ;;
     esac
+}
+
+validate_proxy_path() {
+    value="$1"
+    [ -n "$value" ] || return 0
+    case "$value" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    validate_nginx_value "$value"
 }
 
 validate_host_header() {
     value="$1"
     case "$value" in
-        ''|*' '*|*'/'*|*';'*|*'{'*|*'}'*|*'`'*|*'$('*|*'\n'*|*'\r'*) return 1 ;;
+        ''|*' '*|*'/'*|*';'*|*'{'*|*'}'*|*'`'*|*'$'*|*'"'*|*'\\'*|*'\n'*|*'\r'*) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -437,6 +454,10 @@ render_site_nginx() {
     scheme=$(target_scheme "$target")
     host_only=$(target_host_only "$target")
     path_prefix=$(target_path_prefix "$target")
+    if ! validate_proxy_path "$path_prefix"; then
+        err "目标路径包含不安全字符。"
+        return 1
+    fi
     host_header="$upstream_host"
     cert_dir="$CERT_HOME/$hostname"
     [ -n "$custom_host" ] && host_header="$custom_host"
@@ -466,12 +487,12 @@ render_site_nginx() {
         printf '    proxy_buffer_size 32k;\n'
         printf '    proxy_busy_buffers_size 64k;\n\n'
         printf '    location / {\n'
-        if [ "$scheme" = "https" ]; then
-            printf '        set $proxy_upstream "%s://%s";\n' "$scheme" "$upstream_host"
-            printf '        proxy_pass $proxy_upstream%s;\n' "$path_prefix"
+        if [ -n "$path_prefix" ]; then
+            printf '        set $proxy_request_uri "%s$request_uri";\n' "$path_prefix"
         else
-            printf '        proxy_pass %s;\n' "$target"
+            printf '        set $proxy_request_uri "$request_uri";\n'
         fi
+        printf '        proxy_pass %s://%s$proxy_request_uri;\n' "$scheme" "$upstream_host"
         printf '        proxy_http_version 1.1;\n\n'
         if [ "$scheme" = "https" ]; then
             printf '        proxy_ssl_server_name on;\n'
@@ -524,8 +545,6 @@ render_site_nginx() {
             printf "        sub_filter 'http://%s' 'https://%s';\n" "$host_only" "$hostname"
             printf "        sub_filter '//www.%s' '//%s';\n" "$host_only" "$hostname"
             printf "        sub_filter '//%s' '//%s';\n" "$host_only" "$hostname"
-            printf "        sub_filter 'www.%s' '%s';\n" "$host_only" "$hostname"
-            printf "        sub_filter '%s' '%s';\n" "$host_only" "$hostname"
         fi
         printf '    }\n'
         printf '}\n'
