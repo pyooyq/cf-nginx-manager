@@ -13,6 +13,9 @@ LOCAL_SERVICE_DEFAULT="http://127.0.0.1:8080"
 ACME_HOME="/root/.acme.sh"
 CERT_HOME="/etc/nginx/certs"
 CF_API_BASE="https://api.cloudflare.com/client/v4"
+SCRIPT_URL="https://raw.githubusercontent.com/pyooyq/cf-nginx-manager/main/cf-nginx-manager.sh"
+INSTALL_BIN="/usr/local/bin/cfp"
+LEGACY_BIN="/usr/local/bin/cf-nginx-manager"
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
@@ -125,6 +128,80 @@ ensure_dirs() {
     mkdir -p "$CONFIG_DIR" "$SITES_DIR" "$BACKUP_DIR" "$CERT_HOME" /var/log/cf-nginx-manager
     chmod 700 "$CONFIG_DIR" 2>/dev/null || true
     chmod 700 "$SITES_DIR" 2>/dev/null || true
+}
+
+current_script_path() {
+    script_path="$0"
+    case "$script_path" in
+        */*) ;;
+        *)
+            found_path=$(command -v "$script_path" 2>/dev/null || true)
+            [ -n "$found_path" ] && script_path="$found_path"
+            ;;
+    esac
+    printf '%s' "$script_path"
+}
+
+sync_legacy_command() {
+    if [ -L "$LEGACY_BIN" ]; then
+        target=$(readlink "$LEGACY_BIN" 2>/dev/null || true)
+        [ "$target" = "$INSTALL_BIN" ] && return 0
+    fi
+    rm -f "$LEGACY_BIN" 2>/dev/null || true
+    ln -s "$INSTALL_BIN" "$LEGACY_BIN" 2>/dev/null || cp "$INSTALL_BIN" "$LEGACY_BIN"
+    chmod +x "$LEGACY_BIN" 2>/dev/null || true
+}
+
+install_local_command() {
+    need_root
+    ensure_dirs
+    mkdir -p /usr/local/bin
+    src=$(current_script_path)
+    if [ ! -f "$src" ]; then
+        err "无法找到当前脚本文件，不能安装 cfp 命令。请先用文件方式运行脚本。"
+        return 1
+    fi
+    if [ -f "$INSTALL_BIN" ] && cmp -s "$src" "$INSTALL_BIN"; then
+        chmod +x "$INSTALL_BIN"
+        say "本地命令已安装：$INSTALL_BIN"
+    else
+        cp "$src" "$INSTALL_BIN.tmp" || return 1
+        chmod +x "$INSTALL_BIN.tmp"
+        mv "$INSTALL_BIN.tmp" "$INSTALL_BIN"
+        say "已安装本地命令：cfp"
+    fi
+    sync_legacy_command
+}
+
+self_update() {
+    need_root
+    ensure_dirs
+    if ! has_cmd curl; then
+        err "更新脚本需要 curl。请先执行初始化 / 修复环境安装依赖。"
+        return 1
+    fi
+    mkdir -p /usr/local/bin
+    tmp=$(mktemp)
+    say "下载最新版脚本..."
+    if ! curl -fsSL "$SCRIPT_URL" -o "$tmp"; then
+        rm -f "$tmp"
+        err "下载更新失败。"
+        return 1
+    fi
+    if ! sh -n "$tmp"; then
+        rm -f "$tmp"
+        err "新版脚本语法检查失败，已取消更新。"
+        return 1
+    fi
+    ts=$(date +%Y%m%d-%H%M%S)
+    if [ -f "$INSTALL_BIN" ]; then
+        cp "$INSTALL_BIN" "$BACKUP_DIR/cfp-$ts" 2>/dev/null || true
+    fi
+    chmod +x "$tmp"
+    mv "$tmp" "$INSTALL_BIN"
+    sync_legacy_command
+    say "更新完成：$INSTALL_BIN"
+    say "请重新执行：cfp"
 }
 
 load_config() {
@@ -401,6 +478,7 @@ service_add_default() {
 init_environment() {
     need_root
     ensure_dirs
+    install_local_command || return 1
     install_dependencies || return 1
     render_nginx_map
     service_add_default nginx
@@ -1346,7 +1424,8 @@ uninstall_manager() {
     printf '  - %s\n' "$NGINX_MAP_FILE"
     printf '  - %s\n' "$CLOUDFLARED_INIT"
     printf '  - %s\n' "$CLOUDFLARED_LOG"
-    printf '  - /usr/local/bin/cf-nginx-manager\n'
+    printf '  - %s\n' "$INSTALL_BIN"
+    printf '  - %s\n' "$LEGACY_BIN"
     printf '\n'
     ui_section "不会删除"
     printf '  - nginx / cloudflared 软件包\n'
@@ -1369,7 +1448,8 @@ uninstall_manager() {
     rm -f "$NGINX_MAP_FILE" 2>/dev/null || true
     rm -f "$CLOUDFLARED_INIT" 2>/dev/null || true
     rm -f "$CLOUDFLARED_LOG" 2>/dev/null || true
-    rm -f /usr/local/bin/cf-nginx-manager 2>/dev/null || true
+    rm -f "$INSTALL_BIN" 2>/dev/null || true
+    rm -f "$LEGACY_BIN" 2>/dev/null || true
     rm -rf "$CONFIG_DIR" 2>/dev/null || true
     if has_cmd nginx; then
         nginx -t >/dev/null 2>&1 && rc-service nginx reload >/dev/null 2>&1 || true
@@ -1488,7 +1568,8 @@ main_menu() {
         ui_menu_item 4 "服务管理"
         ui_menu_item 5 "配置 Cloudflare 凭据"
         ui_menu_item 6 "查看当前配置"
-        ui_menu_item 7 "卸载本脚本"
+        ui_menu_item 7 "更新脚本"
+        ui_menu_item 8 "卸载本脚本"
         ui_back_item 0 "退出"
         ui_prompt
         IFS= read -r c </dev/tty
@@ -1499,7 +1580,8 @@ main_menu() {
             4) manage_services ;;
             5) configure_credentials ;;
             6) show_current_config ;;
-            7) uninstall_manager ;;
+            7) self_update ;;
+            8) uninstall_manager ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
         esac
@@ -1528,6 +1610,8 @@ case "${1:-}" in
     sync) cf_sync_ingress ;;
     services) manage_services ;;
     config) configure_credentials ;;
+    update|self-update) self_update ;;
+    install) install_local_command ;;
     uninstall) uninstall_manager ;;
     *) main_menu ;;
 esac

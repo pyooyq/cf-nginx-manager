@@ -33,6 +33,8 @@ Supported non-interactive entry commands:
 ./cf-nginx-manager.sh sync
 ./cf-nginx-manager.sh services
 ./cf-nginx-manager.sh config
+./cf-nginx-manager.sh update
+./cf-nginx-manager.sh install
 ./cf-nginx-manager.sh uninstall
 ```
 
@@ -63,10 +65,11 @@ Managed local state:
 - `/etc/init.d/cloudflared` is a generated OpenRC service using the saved tunnel token.
 - `/var/log/cloudflared.log` is the cloudflared service log.
 - `/etc/nginx/certs/<domain>/` stores public-ingress certificates installed by acme.sh.
+- `/usr/local/bin/cfp` is the preferred installed command; `/usr/local/bin/cf-nginx-manager` is kept as a compatibility entry when possible.
 
 ## High-level architecture
 
-`cf-nginx-manager.sh` is organized around shell functions and a final argument dispatch. With no argument it runs `main_menu`; with an argument it dispatches to `init`, `add`, `list`, `sync`, `services`, `config`, or `uninstall`.
+`cf-nginx-manager.sh` is organized around shell functions and a final argument dispatch. With no argument it runs `main_menu`; with an argument it dispatches to `init`, `add`, `list`, `sync`, `services`, `config`, `update`/`self-update`, `install`, or `uninstall`.
 
 Key areas in the script:
 
