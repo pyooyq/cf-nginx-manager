@@ -206,6 +206,7 @@ self_update() {
     sync_legacy_command
     say "更新完成：$INSTALL_BIN"
     say "请重新执行：cfp"
+    exit 0
 }
 
 load_config() {
@@ -1123,14 +1124,32 @@ cf_dns_conflicts() {
     printf '%s' "$response" | jq -r --arg target "$target" '.result[]? | select((.type != "CNAME") or (.content != $target)) | "\(.type) \(.name) -> \(.content)"'
 }
 
+cf_dns_conflict_ids() {
+    hostname="$1"
+    target="$2"
+    response=$(cf_dns_records "$hostname") || return 1
+    printf '%s' "$response" | jq -r --arg target "$target" '.result[]? | select((.type != "CNAME") or (.content != $target)) | .id'
+}
+
+cf_delete_dns_record_ids() {
+    ids="$1"
+    [ -n "$ids" ] || return 0
+    printf '%s\n' "$ids" | while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        cf_delete_dns_record_id "$id" || exit 1
+    done
+}
+
 cf_upsert_dns() {
     hostname="$1"
     content="$CF_TUNNEL_ID.cfargotunnel.com"
     conflicts=$(cf_dns_conflicts "$hostname" "$content") || return 1
     if [ -n "$conflicts" ]; then
-        err "Cloudflare DNS 存在冲突记录，请先删除或改名："
+        err "Cloudflare DNS 存在冲突记录："
         printf '%s\n' "$conflicts" >&2
-        return 1
+        confirm "是否覆盖这些冲突记录并改为本脚本管理的 CNAME？" || return 1
+        conflict_ids=$(cf_dns_conflict_ids "$hostname" "$content") || return 1
+        cf_delete_dns_record_ids "$conflict_ids" || return 1
     fi
     body=$(jq -cn --arg type CNAME --arg name "$hostname" --arg content "$content" '{type:$type,name:$name,content:$content,proxied:true}')
     id=$(cf_dns_record_id "$hostname")
