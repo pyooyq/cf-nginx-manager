@@ -16,6 +16,7 @@ CF_API_BASE="https://api.cloudflare.com/client/v4"
 SCRIPT_URL="https://raw.githubusercontent.com/pyooyq/cf-nginx-manager/main/cf-nginx-manager.sh"
 INSTALL_BIN="/usr/local/bin/cfp"
 LEGACY_BIN="/usr/local/bin/cf-nginx-manager"
+ASSUME_YES=0
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
@@ -82,6 +83,7 @@ read_secret() {
 
 confirm_default_no() {
     prompt="$1"
+    [ "$ASSUME_YES" = 1 ] && return 0
     printf '%s [y/N]: ' "$prompt" >/dev/tty
     IFS= read -r answer </dev/tty
     case "$answer" in
@@ -92,6 +94,7 @@ confirm_default_no() {
 
 confirm_default_yes() {
     prompt="$1"
+    [ "$ASSUME_YES" = 1 ] && return 0
     printf '%s [Y/n]: ' "$prompt" >/dev/tty
     IFS= read -r answer </dev/tty
     case "$answer" in
@@ -102,6 +105,53 @@ confirm_default_yes() {
 
 confirm() {
     confirm_default_no "$1"
+}
+
+print_help() {
+    cat <<EOF
+$APP_NAME - Cloudflare Tunnel + Nginx 反代管理脚本
+
+用法：
+  cfp [命令] [选项]
+  cf-nginx-manager.sh [命令] [选项]
+
+交互命令：
+  init                         首次初始化 / 修复环境
+  add                          交互式新增反代
+  list                         查看反代列表
+  sync                         同步 Cloudflare DNS 和 Tunnel ingress
+  services                     打开服务管理菜单
+  config                       配置 Cloudflare API Token 和本机设置
+  update | self-update         更新脚本
+  install                      安装本地 cfp 命令
+  uninstall                    卸载本脚本管理的本地文件
+  help | --help | -h           显示帮助
+
+非交互命令：
+  add --host HOST --target TARGET [--mode MODE] [--yes]
+      新增反代。MODE 可选：direct、proxy、mirror、cfcdn、public。
+      direct/proxy/mirror/cfcdn 会使用 Cloudflare Tunnel；public 不使用 Tunnel。
+      proxy/mirror/cfcdn 的链路是 Cloudflare Tunnel -> 本机 Nginx -> 目标服务。
+
+  add --host HOST --target TARGET --mode public --listen-port PORT --ipv4 IPv4 [选项] [--yes]
+      新增公网 HTTPS 入站反代，不使用 Tunnel。
+      可选：--ipv6 IPv6、--proxied、--dns-only、--acme-email EMAIL
+
+  delete --host HOST [--yes]
+      删除指定反代，并清理本脚本管理的 DNS / Tunnel ingress。
+
+  test --host HOST
+      本地测试指定 Host。
+
+常用示例：
+  cfp add --host app.example.com --target 127.0.0.1:3000 --mode direct --yes
+  cfp add --host web.example.com --target https://target.example.com --mode proxy
+  cfp add --host pub.example.com --target 127.0.0.1:3000 --mode public --listen-port 52443 --ipv4 1.2.3.4 --yes
+  cfp delete --host app.example.com --yes
+  cfp test --host app.example.com
+
+首次配置正常只需要 Cloudflare API Token；Account ID / Zone ID 会自动查询，Tunnel ID / Token 会由脚本创建或复用后保存。
+EOF
 }
 
 shell_quote() {
@@ -247,6 +297,10 @@ print_token_permission_requirements() {
 
 manual_cloudflare_ids_fallback() {
     warn "将改为手动输入 Cloudflare Account ID 和 Zone ID。"
+    if [ "${NONINTERACTIVE:-0}" = 1 ]; then
+        err "非交互模式不能手动补充 Account ID / Zone ID。请先执行 cfp config，或给 API Token 增加 Zone Read 权限。"
+        return 1
+    fi
     CF_ACCOUNT_ID=$(read_input "Cloudflare Account ID" "${CF_ACCOUNT_ID:-}")
     CF_ZONE_ID=$(read_input "Cloudflare Zone ID" "${CF_ZONE_ID:-}")
     if [ -z "$CF_ACCOUNT_ID" ] || [ -z "$CF_ZONE_ID" ]; then
@@ -266,6 +320,10 @@ select_cloudflare_result_index() {
     if [ "$count" -eq 1 ]; then
         printf '0'
         return 0
+    fi
+    if [ "${NONINTERACTIVE:-0}" = 1 ]; then
+        err "检测到多个 $title，非交互模式不能选择。请先执行 cfp config 完成配置。"
+        return 1
     fi
 
     printf '%s\n' "检测到多个 $title，请选择：" >/dev/tty
@@ -484,6 +542,10 @@ require_cf_api_token() {
     load_config
     changed=0
     if [ -z "${CF_API_TOKEN:-}" ]; then
+        if [ "${NONINTERACTIVE:-0}" = 1 ]; then
+            err "缺少 CF_API_TOKEN。请先执行 cfp config，或使用交互模式配置 Cloudflare API Token。"
+            return 1
+        fi
         say "公网入站反代申请证书需要 Cloudflare API Token。"
         CF_API_TOKEN=$(read_secret "Cloudflare API Token（输入不会回显）")
         changed=1
@@ -1410,6 +1472,29 @@ choose_public_dns_settings() {
                 warn "公网 IPv6 不合法。"
             done
         fi
+    fi
+}
+
+validate_public_dns_settings() {
+    listen_port="$1"
+    public_ipv4="$2"
+    public_ipv6="${3:-}"
+    public_dns_proxied="${4:-0}"
+    case "$public_dns_proxied" in
+        0|1) ;;
+        *) err "公网 DNS proxied 参数不合法。"; return 1 ;;
+    esac
+    if [ "$public_dns_proxied" = 1 ] && ! cloudflare_https_port_supported "$listen_port"; then
+        err "Cloudflare 橙云 HTTPS 不支持端口 $listen_port。请使用 443/2053/2083/2087/2096/8443，或改用 --dns-only。"
+        return 1
+    fi
+    if ! validate_ipv4 "$public_ipv4"; then
+        err "公网 IPv4 不合法。"
+        return 1
+    fi
+    if [ -n "$public_ipv6" ] && ! validate_ipv6 "$public_ipv6"; then
+        err "公网 IPv6 不合法。"
+        return 1
     fi
 }
 
@@ -2420,9 +2505,123 @@ show_current_config() {
     list_sites || say "暂无站点。"
 }
 
-case "${1:-}" in
+need_option_value() {
+    opt="$1"
+    value="${2:-}"
+    if [ -z "$value" ]; then
+        err "$opt 需要参数。"
+        return 1
+    fi
+}
+
+parse_add_command() {
+    NONINTERACTIVE=1
+    load_config
+    hostname=""
+    raw_target=""
+    mode="direct"
+    custom_host=""
+    listen_port=""
+    public_dns_proxied="0"
+    public_ipv4=""
+    public_ipv6=""
+    acme_email=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --host|-H) need_option_value "$1" "${2:-}" || return 1; hostname="$2"; shift 2 ;;
+            --target|-t) need_option_value "$1" "${2:-}" || return 1; raw_target="$2"; shift 2 ;;
+            --mode|-m) need_option_value "$1" "${2:-}" || return 1; mode="$2"; shift 2 ;;
+            --host-header) need_option_value "$1" "${2:-}" || return 1; custom_host="$2"; shift 2 ;;
+            --listen-port|--port|-p) need_option_value "$1" "${2:-}" || return 1; listen_port="$2"; shift 2 ;;
+            --ipv4) need_option_value "$1" "${2:-}" || return 1; public_ipv4="$2"; shift 2 ;;
+            --ipv6) need_option_value "$1" "${2:-}" || return 1; public_ipv6="$2"; shift 2 ;;
+            --proxied) public_dns_proxied="1"; shift ;;
+            --dns-only) public_dns_proxied="0"; shift ;;
+            --acme-email) need_option_value "$1" "${2:-}" || return 1; acme_email="$2"; shift 2 ;;
+            --yes|-y) ASSUME_YES=1; shift ;;
+            --help|-h) print_help; return 0 ;;
+            *) err "未知 add 选项：$1"; print_help; return 1 ;;
+        esac
+    done
+    validate_hostname "$hostname" || { err "必须通过 --host 提供合法域名。"; return 1; }
+    [ -n "$raw_target" ] || { err "必须通过 --target 提供目标地址。"; return 1; }
+    validate_mode "$mode" || { err "--mode 只支持 direct/proxy/mirror/cfcdn/public。"; return 1; }
+    target=$(normalize_target "$raw_target")
+    validate_nginx_value "$target" || { err "目标地址包含不安全字符。"; return 1; }
+    validate_http_target "$target" || return 1
+    upstream_host=$(target_authority "$target")
+    validate_host_header "$upstream_host" || { err "无法从目标地址解析出安全的上游 Host。"; return 1; }
+    service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
+    if [ "$mode" = "direct" ]; then
+        service="$target"
+        custom_host=""
+    elif [ "$mode" = "cfcdn" ] || [ "$mode" = "public" ]; then
+        [ -n "$custom_host" ] || custom_host="$upstream_host"
+    elif [ -z "$custom_host" ]; then
+        custom_host="$upstream_host"
+    fi
+    if [ -n "$custom_host" ]; then
+        validate_host_header "$custom_host" || { err "Host 头包含不安全字符。"; return 1; }
+    fi
+    if [ "$mode" = "public" ]; then
+        [ -n "$listen_port" ] || { err "public 模式必须提供 --listen-port。"; return 1; }
+        validate_port "$listen_port" && [ "$listen_port" != "80" ] || { err "HTTPS 监听端口不合法，且不能使用 80。"; return 1; }
+        [ -n "$public_ipv4" ] || { err "public 模式必须提供 --ipv4。"; return 1; }
+        validate_public_dns_settings "$listen_port" "$public_ipv4" "$public_ipv6" "$public_dns_proxied" || return 1
+        service=""
+    else
+        listen_port=""
+        public_dns_proxied="0"
+        public_ipv4=""
+        public_ipv6=""
+        acme_email=""
+    fi
+    add_site_execute "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port" "$public_dns_proxied" "$public_ipv4" "$public_ipv6" "$acme_email"
+}
+
+parse_host_command() {
+    action="$1"
+    shift
+    NONINTERACTIVE=1
+    hostname=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --host|-H) need_option_value "$1" "${2:-}" || return 1; hostname="$2"; shift 2 ;;
+            --yes|-y) ASSUME_YES=1; shift ;;
+            --help|-h) print_help; return 0 ;;
+            *) err "未知 $action 选项：$1"; print_help; return 1 ;;
+        esac
+    done
+    validate_hostname "$hostname" || { err "必须通过 --host 提供合法域名。"; return 1; }
+    case "$action" in
+        delete) delete_site_by_host "$hostname" ;;
+        test) local_test_site_host "$hostname" ;;
+        *) err "未知命令：$action"; return 1 ;;
+    esac
+}
+
+cmd="${1:-}"
+if [ $# -gt 0 ]; then
+    shift
+fi
+case "$cmd" in
+    '' ) main_menu ;;
     init) init_environment ;;
-    add) add_site ;;
+    add)
+        if [ "$#" -gt 0 ]; then
+            parse_add_command "$@"
+        else
+            add_site
+        fi
+        ;;
+    delete|remove|rm)
+        if [ "$#" -gt 0 ]; then
+            parse_host_command delete "$@"
+        else
+            delete_site
+        fi
+        ;;
+    test) parse_host_command test "$@" ;;
     list) list_sites ;;
     sync) cf_sync_ingress ;;
     services) manage_services ;;
@@ -2430,5 +2629,6 @@ case "${1:-}" in
     update|self-update) self_update ;;
     install) install_local_command ;;
     uninstall) uninstall_manager ;;
-    *) main_menu ;;
+    help|--help|-h) print_help ;;
+    *) err "未知命令：$cmd"; print_help; exit 1 ;;
 esac

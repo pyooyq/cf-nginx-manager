@@ -8,7 +8,7 @@
 - 用 Cloudflare Tunnel 把域名流量转进 VPS。
 - 可以让 Tunnel 直接连到目标服务。
 - 也可以让 Tunnel 先到 VPS 本地 Nginx，再由 Nginx 反代。
-- 新增、修改、删除反代都用菜单完成。
+- 新增、修改、删除反代可以用菜单完成，也支持常用非交互命令。
 - 自动帮你配置 Cloudflare DNS 和 Tunnel ingress，并在执行前显示操作摘要。
 
 访问链路按模式分为三类：
@@ -42,7 +42,7 @@ Public 入站模式：
 - NAT VPS 没有公网 80/443，但想绑定自己的域名。
 - 给本地服务、面板、API 加一个 HTTPS 域名入口。
 - 简单网站镜像式反代。
-- 用菜单管理多个反代站点。
+- 用菜单或命令行管理多个反代站点。
 
 不保证适合：
 
@@ -72,6 +72,7 @@ Public 入站模式：
 - 也可以创建不走 Tunnel 的公网 HTTPS 入站反代。
 - 启动、停止、重启 `nginx` 和 `cloudflared`。
 - 安装本地 `cfp` 命令并支持自我更新。
+- 通过 `cfp help` 查看交互和非交互命令用法。
 - 新增、修改站点时输入错误会就地重试，执行前会显示摘要并要求确认。
 
 ## 一键运行
@@ -265,6 +266,61 @@ example.com
 ```text
 https://app.example.com
 ```
+
+## 非交互命令和 help
+
+查看帮助：
+
+```sh
+cfp help
+cfp add --help
+```
+
+常用命令：
+
+```sh
+cfp init
+cfp list
+cfp sync
+cfp config
+cfp services
+cfp update
+cfp uninstall
+```
+
+非交互新增 Tunnel 直连反代：
+
+```sh
+cfp add --host app.example.com --target 127.0.0.1:3000 --mode direct --yes
+```
+
+非交互新增 Tunnel + Nginx 普通反代：
+
+```sh
+cfp add --host web.example.com --target https://target.example.com --mode proxy --host-header target.example.com --yes
+```
+
+非交互新增 Public 入站反代，不使用 Tunnel：
+
+```sh
+cfp add --host pub.example.com --target 127.0.0.1:3000 --mode public --listen-port 52443 --ipv4 1.2.3.4 --dns-only --yes
+```
+
+如果要使用 Cloudflare 橙云代理，把 `--dns-only` 改为 `--proxied`，端口必须是 Cloudflare 支持的 HTTPS 端口。
+
+删除指定反代：
+
+```sh
+cfp delete --host app.example.com --yes
+```
+
+本地测试指定 Host：
+
+```sh
+cfp test --host app.example.com
+```
+
+非交互命令不会让你输入 Cloudflare API Token，也不会手动兜底输入 Account ID / Zone ID。请先执行 `cfp config` 完成 Cloudflare 配置；正常情况下用户只需要提供 API Token，其他 ID/Token 由脚本自动查询、创建或复用后保存。
 
 ## 反代模式怎么选
 
