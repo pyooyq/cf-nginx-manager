@@ -251,7 +251,7 @@ manual_cloudflare_ids_fallback() {
     CF_ZONE_ID=$(read_input "Cloudflare Zone ID" "${CF_ZONE_ID:-}")
     if [ -z "$CF_ACCOUNT_ID" ] || [ -z "$CF_ZONE_ID" ]; then
         err "Account ID 和 Zone ID 都不能为空。"
-        exit 1
+        return 1
     fi
 }
 
@@ -288,17 +288,17 @@ discover_cloudflare_ids() {
     zones_response=$(cf_api_request GET "/zones") || {
         print_token_permission_requirements
         manual_cloudflare_ids_fallback
-        return 0
+        return $?
     }
     if ! cf_api_success "$zones_response"; then
         print_token_permission_requirements
         manual_cloudflare_ids_fallback
-        return 0
+        return $?
     fi
     zone_idx=$(select_cloudflare_result_index "Cloudflare Zone" "$zones_response") || {
         print_token_permission_requirements
         manual_cloudflare_ids_fallback
-        return 0
+        return $?
     }
     CF_ZONE_ID=$(printf '%s' "$zones_response" | jq -r ".result[$zone_idx].id // empty")
     CF_ACCOUNT_ID=$(printf '%s' "$zones_response" | jq -r ".result[$zone_idx].account.id // empty")
@@ -308,17 +308,17 @@ discover_cloudflare_ids() {
         accounts_response=$(cf_api_request GET "/accounts") || {
             print_token_permission_requirements
             manual_cloudflare_ids_fallback
-            return 0
+            return $?
         }
         if ! cf_api_success "$accounts_response"; then
             print_token_permission_requirements
             manual_cloudflare_ids_fallback
-            return 0
+            return $?
         fi
         account_idx=$(select_cloudflare_result_index "Cloudflare Account" "$accounts_response") || {
             print_token_permission_requirements
             manual_cloudflare_ids_fallback
-            return 0
+            return $?
         }
         CF_ACCOUNT_ID=$(printf '%s' "$accounts_response" | jq -r ".result[$account_idx].id // empty")
     fi
@@ -326,6 +326,7 @@ discover_cloudflare_ids() {
     if [ -z "$CF_ZONE_ID" ] || [ -z "$CF_ACCOUNT_ID" ]; then
         print_token_permission_requirements
         manual_cloudflare_ids_fallback
+        return $?
     fi
 }
 
@@ -432,9 +433,8 @@ configure_credentials() {
         err "Cloudflare API Token 不能为空。"
         exit 1
     fi
-    discover_cloudflare_ids
-    LOCAL_SERVICE=$(read_input "本机 Nginx 服务地址" "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}")
-    nginx_service_url "$LOCAL_SERVICE" >/dev/null || return 1
+    discover_cloudflare_ids || return 1
+    LOCAL_SERVICE=$(read_nginx_service_loop "本机 Nginx 服务地址" "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}")
     if confirm_default_no "是否启用 Nginx 上游 IPv6 解析？没有 IPv6 出口的 VPS 请保持关闭"; then
         UPSTREAM_IPV6=1
     else
@@ -461,8 +461,21 @@ configure_credentials() {
 
 require_config() {
     load_config
-    if [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${CF_ZONE_ID:-}" ] || [ -z "${CF_API_TOKEN:-}" ] || [ -z "${CF_TUNNEL_ID:-}" ] || [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
-        err "尚未完成 Cloudflare 配置，请先执行初始化或配置 Cloudflare 凭据。"
+    missing=""
+    [ -n "${CF_API_TOKEN:-}" ] || missing="$missing CF_API_TOKEN"
+    [ -n "${CF_ACCOUNT_ID:-}" ] || missing="$missing CF_ACCOUNT_ID"
+    [ -n "${CF_ZONE_ID:-}" ] || missing="$missing CF_ZONE_ID"
+    [ -n "${CF_TUNNEL_ID:-}" ] || missing="$missing CF_TUNNEL_ID"
+    [ -n "${CF_TUNNEL_TOKEN:-}" ] || missing="$missing CF_TUNNEL_TOKEN"
+    if [ -n "$missing" ]; then
+        err "Cloudflare Tunnel 配置不完整，缺少：${missing# }"
+        if [ -z "${CF_API_TOKEN:-}" ]; then
+            err "请先执行 cfp config 输入 Cloudflare API Token；正常情况下其他 ID/Token 会由脚本自动查询、创建或复用后保存。"
+        elif [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${CF_ZONE_ID:-}" ]; then
+            err "请执行 cfp config 重新查询 Cloudflare Account/Zone；如果 Token 权限不足，脚本会提示手动输入兜底。"
+        else
+            err "当前操作需要 Cloudflare Tunnel。请执行 cfp config 并选择配置 Tunnel，或改用 public 模式。"
+        fi
         return 1
     fi
 }
@@ -477,10 +490,10 @@ require_cf_api_token() {
     fi
     if [ -z "${CF_API_TOKEN:-}" ]; then
         err "Cloudflare API Token 不能为空。"
-        exit 1
+        return 1
     fi
     if [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${CF_ZONE_ID:-}" ]; then
-        discover_cloudflare_ids
+        discover_cloudflare_ids || return 1
         changed=1
     fi
     if [ "$changed" = 1 ]; then
@@ -702,6 +715,18 @@ nginx_service_url() {
     printf 'http://%s' "$authority"
 }
 
+read_nginx_service_loop() {
+    prompt="$1"
+    default="${2:-$LOCAL_SERVICE_DEFAULT}"
+    while :; do
+        value=$(read_input "$prompt" "$default")
+        if nginx_service_url "$value" >/dev/null; then
+            printf '%s' "$value"
+            return 0
+        fi
+    done
+}
+
 nginx_listen_from_service() {
     service_url=$(nginx_service_url "$1") || return 1
     target_authority "$service_url"
@@ -786,6 +811,71 @@ validate_hostname() {
         esac
     done
     [ "${#host}" -le 253 ]
+}
+
+read_hostname_loop() {
+    prompt="$1"
+    default="${2:-}"
+    while :; do
+        value=$(read_input "$prompt" "$default")
+        if validate_hostname "$value"; then
+            printf '%s' "$value"
+            return 0
+        fi
+        warn "域名格式不正确，请输入类似 app.example.com 的完整域名。"
+    done
+}
+
+read_target_loop() {
+    prompt="$1"
+    default="${2:-}"
+    while :; do
+        raw=$(read_input "$prompt" "$default")
+        if [ -z "$raw" ]; then
+            warn "目标地址不能为空。"
+            continue
+        fi
+        target=$(normalize_target "$raw")
+        if ! validate_nginx_value "$target"; then
+            warn "目标地址包含不安全字符。"
+            continue
+        fi
+        if ! validate_http_target "$target"; then
+            continue
+        fi
+        upstream_host=$(target_authority "$target")
+        if ! validate_host_header "$upstream_host"; then
+            warn "无法从目标地址解析出安全的上游 Host。"
+            continue
+        fi
+        printf '%s' "$target"
+        return 0
+    done
+}
+
+read_port_loop() {
+    prompt="$1"
+    default="${2:-}"
+    while :; do
+        value=$(read_input "$prompt" "$default")
+        if validate_port "$value" && [ "$value" != "80" ]; then
+            printf '%s' "$value"
+            return 0
+        fi
+        warn "HTTPS 监听端口不合法，且不能使用 80。"
+    done
+}
+
+read_host_header_loop() {
+    upstream_host="$1"
+    while :; do
+        value=$(choose_host_header "$upstream_host")
+        if validate_host_header "$value"; then
+            printf '%s' "$value"
+            return 0
+        fi
+        warn "Host 头包含不安全字符，请重新输入。"
+    done
 }
 
 validate_port() {
@@ -1269,31 +1359,36 @@ choose_public_dns_settings() {
     old_proxied="${2:-0}"
     old_ipv4="${3:-}"
     old_ipv6="${4:-}"
-    printf '%s\n' "公网 DNS 模式：" >/dev/tty
-    printf '%s\n' "1) DNS only 灰云（推荐，端口不限）" >/dev/tty
-    printf '%s\n' "2) Cloudflare 代理橙云（仅限 Cloudflare 支持的 HTTPS 端口）" >/dev/tty
-    if [ "$old_proxied" = "1" ]; then default_choice=2; else default_choice=1; fi
-    printf '选择 [%s]: ' "$default_choice" >/dev/tty
-    IFS= read -r dns_choice </dev/tty
-    [ -n "$dns_choice" ] || dns_choice="$default_choice"
-    case "$dns_choice" in
-        2)
-            if ! cloudflare_https_port_supported "$listen_port"; then
-                err "Cloudflare 橙云 HTTPS 不支持端口 $listen_port。请改用灰云 DNS only，或使用 443/2053/2083/2087/2096/8443。"
-                return 1
-            fi
-            public_dns_proxied=1
-            ;;
-        *) public_dns_proxied=0 ;;
-    esac
+    while :; do
+        printf '%s\n' "公网 DNS 模式：" >/dev/tty
+        printf '%s\n' "1) DNS only 灰云（推荐，端口不限）" >/dev/tty
+        printf '%s\n' "2) Cloudflare 代理橙云（仅限 Cloudflare 支持的 HTTPS 端口）" >/dev/tty
+        if [ "$old_proxied" = "1" ]; then default_choice=2; else default_choice=1; fi
+        printf '选择 [%s]: ' "$default_choice" >/dev/tty
+        IFS= read -r dns_choice </dev/tty
+        [ -n "$dns_choice" ] || dns_choice="$default_choice"
+        case "$dns_choice" in
+            2)
+                if ! cloudflare_https_port_supported "$listen_port"; then
+                    warn "Cloudflare 橙云 HTTPS 不支持端口 $listen_port。请改用灰云 DNS only，或使用 443/2053/2083/2087/2096/8443。"
+                    continue
+                fi
+                public_dns_proxied=1
+                ;;
+            *) public_dns_proxied=0 ;;
+        esac
+        break
+    done
 
     detected_ipv4=$(detect_public_ipv4 || true)
     default_ipv4="${old_ipv4:-$detected_ipv4}"
-    public_ipv4=$(read_input "公网 IPv4 A 记录" "$default_ipv4")
-    if ! validate_ipv4 "$public_ipv4"; then
-        err "公网 IPv4 不合法。"
-        return 1
-    fi
+    while :; do
+        public_ipv4=$(read_input "公网 IPv4 A 记录" "$default_ipv4")
+        if validate_ipv4 "$public_ipv4"; then
+            break
+        fi
+        warn "公网 IPv4 不合法。"
+    done
 
     public_ipv6=""
     if [ "$UPSTREAM_IPV6" = "1" ]; then
@@ -1307,11 +1402,13 @@ choose_public_dns_settings() {
         if $use_ipv6 "$use_ipv6_prompt"; then
             detected_ipv6=$(detect_public_ipv6 || true)
             default_ipv6="${old_ipv6:-$detected_ipv6}"
-            public_ipv6=$(read_input "公网 IPv6 AAAA 记录（留空跳过）" "$default_ipv6")
-            if [ -n "$public_ipv6" ] && ! validate_ipv6 "$public_ipv6"; then
-                err "公网 IPv6 不合法。"
-                return 1
-            fi
+            while :; do
+                public_ipv6=$(read_input "公网 IPv6 AAAA 记录（留空跳过）" "$default_ipv6")
+                if [ -z "$public_ipv6" ] || validate_ipv6 "$public_ipv6"; then
+                    break
+                fi
+                warn "公网 IPv6 不合法。"
+            done
         fi
     fi
 }
@@ -1478,6 +1575,24 @@ cf_remove_ingress_hostname() {
     cf_api_success "$response"
 }
 
+validate_mode() {
+    case "$1" in
+        direct|proxy|mirror|cfcdn|public) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+mode_path_label() {
+    case "$1" in
+        direct) printf 'Cloudflare Tunnel -> 目标服务（不经过 Nginx）' ;;
+        proxy) printf 'Cloudflare Tunnel -> 本机 Nginx -> 目标服务' ;;
+        mirror) printf 'Cloudflare Tunnel -> 本机 Nginx 镜像反代 -> 目标站' ;;
+        cfcdn) printf 'Cloudflare Tunnel -> 本机 Nginx -> 已套 Cloudflare 的目标站' ;;
+        public) printf '公网 HTTPS 入站 -> 本机 Nginx -> 目标服务（不使用 Tunnel）' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 mode_choice_number() {
     case "$1" in
         proxy) printf '2' ;;
@@ -1492,11 +1607,11 @@ choose_mode() {
     default_mode="${1:-direct}"
     default_choice=$(mode_choice_number "$default_mode")
     printf '%s\n' "请选择反代模式：" >/dev/tty
-    printf '%s\n' "1) Cloudflare Tunnel 直连服务（推荐：本机端口、IP:PORT、自建面板、API）" >/dev/tty
-    printf '%s\n' "2) Nginx 普通反代（经过 Tunnel，需要 Nginx 处理 Host/Cookie/跳转时用）" >/dev/tty
-    printf '%s\n' "3) Nginx 网站镜像反代（经过 Tunnel，仅适合简单网页）" >/dev/tty
-    printf '%s\n' "4) Nginx 代理 CF CDN 目标站（经过 Tunnel，目标站本身套了 Cloudflare 时用）" >/dev/tty
-    printf '%s\n' "5) Nginx 公网入站反代（不使用 Cloudflare Tunnel，需要开放入站端口）" >/dev/tty
+    printf '%s\n' "1) Tunnel 直连：Cloudflare Tunnel -> 目标服务（推荐：本机端口、IP:PORT、自建面板、API）" >/dev/tty
+    printf '%s\n' "2) Tunnel + Nginx 普通反代：Cloudflare Tunnel -> 本机 Nginx -> 目标服务" >/dev/tty
+    printf '%s\n' "3) Tunnel + Nginx 镜像反代：Cloudflare Tunnel -> 本机 Nginx -> 简单网页" >/dev/tty
+    printf '%s\n' "4) Tunnel + Nginx 代理 CF CDN 目标站：目标站本身套了 Cloudflare 时用" >/dev/tty
+    printf '%s\n' "5) Public 入站：公网 HTTPS -> 本机 Nginx -> 目标服务（不使用 Tunnel）" >/dev/tty
     printf '%s\n' "0) 取消" >/dev/tty
     printf '选择 [%s]: ' "$default_choice" >/dev/tty
     IFS= read -r choice </dev/tty
@@ -1544,83 +1659,135 @@ rollback_new_site() {
     reload_nginx_if_needed >/dev/null 2>&1 || true
 }
 
-add_site() {
+dns_mode_label() {
+    if [ "$1" = "1" ]; then
+        printf 'Cloudflare 代理橙云'
+    else
+        printf 'DNS only 灰云'
+    fi
+}
+
+show_site_operation_summary() {
+    action="$1"
+    hostname="$2"
+    target="$3"
+    mode="$4"
+    upstream_host="$5"
+    custom_host="$6"
+    service="$7"
+    listen_port="${8:-}"
+    public_dns_proxied="${9:-0}"
+    public_ipv4="${10:-}"
+    public_ipv6="${11:-}"
+    acme_email="${12:-}"
+
+    printf '\n'
+    ui_section "操作摘要"
+    printf '  %-12s: %s\n' "操作" "$action"
+    printf '  %-12s: %s\n' "域名" "$hostname"
+    printf '  %-12s: %s\n' "目标地址" "$target"
+    printf '  %-12s: %s [%s]\n' "模式" "$(mode_label "$mode")" "$mode"
+    printf '  %-12s: %s\n' "访问链路" "$(mode_path_label "$mode")"
+    if [ "$mode" = "direct" ]; then
+        printf '  %-12s: 不生成\n' "Nginx配置"
+        printf '  %-12s: %s\n' "Tunnel服务" "$service"
+    elif [ "$mode" = "public" ]; then
+        printf '  %-12s: %s\n' "Nginx配置" "$(site_conf_path "$hostname")"
+        printf '  %-12s: %s\n' "监听端口" "$listen_port"
+        printf '  %-12s: %s\n' "Host头" "$custom_host"
+        printf '  %-12s: %s\n' "DNS模式" "$(dns_mode_label "$public_dns_proxied")"
+        printf '  %-12s: A %s\n' "DNS记录" "$public_ipv4"
+        if [ -n "$public_ipv6" ]; then
+            printf '  %-12s: AAAA %s\n' "" "$public_ipv6"
+        fi
+        if [ -n "$acme_email" ]; then
+            printf '  %-12s: %s\n' "ACME邮箱" "$acme_email"
+        else
+            printf '  %-12s: 自动生成\n' "ACME邮箱"
+        fi
+        printf '  %-12s: %s/%s\n' "证书目录" "$CERT_HOME" "$hostname"
+        printf '  %-12s: 不修改 Tunnel ingress\n' "Cloudflare"
+    else
+        printf '  %-12s: %s\n' "Nginx配置" "$(site_conf_path "$hostname")"
+        printf '  %-12s: %s\n' "本机Nginx" "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
+        printf '  %-12s: %s\n' "Host头" "$custom_host"
+        printf '  %-12s: %s\n' "Tunnel服务" "$service"
+    fi
+    if [ "$mode" != "public" ]; then
+        printf '  %-12s: CNAME + Tunnel ingress\n' "Cloudflare"
+    fi
+    printf '\n'
+}
+
+confirm_site_operation() {
+    show_site_operation_summary "$@"
+    confirm_default_yes "确认执行以上操作？"
+}
+
+add_site_execute() {
+    hostname="$1"
+    target="$2"
+    mode="$3"
+    upstream_host="$4"
+    custom_host="$5"
+    service="$6"
+    listen_port="${7:-}"
+    public_dns_proxied="${8:-0}"
+    public_ipv4="${9:-}"
+    public_ipv6="${10:-}"
+    acme_email="${11:-}"
+
     need_root
     load_config
     ensure_dirs
-    hostname=$(read_input "公网域名，例如 app.example.com" "")
-    if ! validate_hostname "$hostname"; then
-        err "域名格式不正确。"
+    if [ -f "$(site_env_path "$hostname")" ]; then
+        err "该域名已存在本地记录：$hostname。请使用修改反代，或先删除后再新增。"
         return 1
-    fi
-    raw_target=$(read_input "目标地址，例如 https://target.com 或 127.0.0.1:3000" "")
-    [ -n "$raw_target" ] || { err "目标地址不能为空。"; return 1; }
-    target=$(normalize_target "$raw_target")
-    if ! validate_nginx_value "$target"; then
-        err "目标地址包含不安全字符。"
-        return 1
-    fi
-    validate_http_target "$target" || return 1
-    upstream_host=$(target_authority "$target")
-    if ! validate_host_header "$upstream_host"; then
-        err "无法从目标地址解析出安全的上游 Host。"
-        return 1
-    fi
-    mode=$(choose_mode direct) || return 0
-    service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
-    custom_host=""
-    listen_port=""
-    public_dns_proxied=""
-    public_ipv4=""
-    public_ipv6=""
-    if [ "$mode" = "direct" ]; then
-        service="$target"
-    elif [ "$mode" = "cfcdn" ]; then
-        custom_host="$upstream_host"
-    elif [ "$mode" = "public" ]; then
-        custom_host="$upstream_host"
-    else
-        custom_host=$(choose_host_header "$upstream_host")
-        if ! validate_host_header "$custom_host"; then
-            err "Host 头包含不安全字符。"
-            return 1
-        fi
     fi
     if [ "$mode" = "public" ]; then
         require_cf_api_token || return 1
-        listen_port=$(read_input "公网 HTTPS 入站监听端口，例如 2053 或 52443" "52443")
-        if ! validate_port "$listen_port" || [ "$listen_port" = "80" ]; then
-            err "HTTPS 监听端口不合法，且不能使用 80。"
-            return 1
-        fi
-        choose_public_dns_settings "$listen_port" || return 1
-        acme_email=$(read_input "ACME 账户邮箱（留空自动生成）" "")
-        issue_cloudflare_cert "$hostname" "$acme_email" || return 1
-        service=""
     else
         require_config || return 1
     fi
+    confirm_site_operation "新增反代" "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port" "$public_dns_proxied" "$public_ipv4" "$public_ipv6" "$acme_email" || return 0
 
+    if [ "$mode" = "public" ]; then
+        say "[1/5] 申请或安装 HTTPS 证书。"
+        issue_cloudflare_cert "$hostname" "$acme_email" || return 1
+        say "[2/5] 备份并写入本地站点记录。"
+    else
+        say "[1/4] 备份并写入本地站点记录。"
+    fi
     backup_managed_files
     save_site_env "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port" "$public_dns_proxied" "$public_ipv4" "$public_ipv6"
+
     if [ "$mode" = "direct" ]; then
+        say "[2/4] Tunnel 直连模式不生成 Nginx 配置。"
         rm -f "$(site_conf_path "$hostname")"
     else
+        if [ "$mode" = "public" ]; then
+            say "[3/5] 生成并测试 Nginx 配置。"
+        else
+            say "[2/4] 生成并测试 Nginx 配置。"
+        fi
         if ! render_site_nginx "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port" || ! nginx_reload_safe; then
             rm -f "$(site_conf_path "$hostname")" "$(site_env_path "$hostname")"
             err "Nginx 配置测试失败，已回滚本次新增。"
             return 1
         fi
     fi
+
     if [ "$mode" = "public" ]; then
+        say "[4/5] 更新 Cloudflare A/AAAA DNS。"
         if ! cf_upsert_public_dns "$hostname" "$public_ipv4" "$public_ipv6" "$public_dns_proxied"; then
             rollback_new_site "$hostname"
             err "Cloudflare 公网 DNS 配置失败，已回滚本次新增。请检查 Cloudflare DNS 记录。"
             return 1
         fi
-        say "新增完成：https://$hostname:$listen_port -> $target [public]"
+        say "[5/5] 新增完成：https://$hostname:$listen_port -> $target [public]"
         say "请确认防火墙/安全组已放行 TCP $listen_port。"
     else
+        say "[3/4] 同步 Cloudflare DNS 和 Tunnel ingress。"
         if ! cf_sync_ingress; then
             cf_delete_dns "$hostname" >/dev/null 2>&1 || true
             cf_remove_ingress_hostname "$hostname" >/dev/null 2>&1 || true
@@ -1628,17 +1795,47 @@ add_site() {
             err "Cloudflare 同步失败，已回滚本次新增。"
             return 1
         fi
-        say "新增完成：https://$hostname -> $target [$mode]"
+        say "[4/4] 新增完成：https://$hostname -> $target [$mode]"
     fi
+}
+
+add_site() {
+    need_root
+    load_config
+    hostname=$(read_hostname_loop "公网域名，例如 app.example.com" "")
+    target=$(read_target_loop "目标地址，例如 https://target.com 或 127.0.0.1:3000" "")
+    upstream_host=$(target_authority "$target")
+    mode=$(choose_mode direct) || return 0
+    service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
+    custom_host=""
+    listen_port=""
+    public_dns_proxied="0"
+    public_ipv4=""
+    public_ipv6=""
+    acme_email=""
+    if [ "$mode" = "direct" ]; then
+        service="$target"
+    elif [ "$mode" = "cfcdn" ] || [ "$mode" = "public" ]; then
+        custom_host="$upstream_host"
+    else
+        custom_host=$(read_host_header_loop "$upstream_host")
+    fi
+    if [ "$mode" = "public" ]; then
+        listen_port=$(read_port_loop "公网 HTTPS 入站监听端口，例如 2053 或 52443" "52443")
+        choose_public_dns_settings "$listen_port" || return 1
+        acme_email=$(read_input "ACME 账户邮箱（留空自动生成）" "")
+        service=""
+    fi
+    add_site_execute "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port" "$public_dns_proxied" "$public_ipv4" "$public_ipv6" "$acme_email"
 }
 
 mode_label() {
     case "$1" in
         direct) printf 'Tunnel直连' ;;
-        proxy) printf 'Nginx普通反代' ;;
-        mirror) printf 'Nginx镜像反代' ;;
-        cfcdn) printf 'Nginx代理CF CDN站' ;;
-        public) printf 'Nginx公网入站反代' ;;
+        proxy) printf 'Tunnel+Nginx普通反代' ;;
+        mirror) printf 'Tunnel+Nginx镜像反代' ;;
+        cfcdn) printf 'Tunnel+Nginx代理CF CDN站' ;;
+        public) printf 'Public入站Nginx反代' ;;
         *) printf '%s' "$1" ;;
     esac
 }
@@ -1703,23 +1900,9 @@ edit_site() {
     old_public_ipv6="${PUBLIC_IPV6:-}"
     old_conf=$(site_conf_path "$old_hostname")
 
-    new_hostname=$(read_input "公网域名" "$HOSTNAME")
-    if ! validate_hostname "$new_hostname"; then
-        err "域名格式不正确。"
-        return 1
-    fi
-    raw_target=$(read_input "目标地址" "$TARGET")
-    target=$(normalize_target "$raw_target")
-    if ! validate_nginx_value "$target"; then
-        err "目标地址包含不安全字符。"
-        return 1
-    fi
-    validate_http_target "$target" || return 1
+    new_hostname=$(read_hostname_loop "公网域名" "$HOSTNAME")
+    target=$(read_target_loop "目标地址" "$TARGET")
     upstream_host=$(target_authority "$target")
-    if ! validate_host_header "$upstream_host"; then
-        err "无法从目标地址解析出安全的上游 Host。"
-        return 1
-    fi
     mode=$(choose_mode "${MODE:-direct}") || return 0
     service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
     custom_host=""
@@ -1734,27 +1917,27 @@ edit_site() {
     elif [ "$mode" = "public" ]; then
         custom_host="$upstream_host"
     else
-        custom_host=$(choose_host_header "$upstream_host")
-        if ! validate_host_header "$custom_host"; then
-            err "Host 头包含不安全字符。"
-            return 1
-        fi
+        custom_host=$(read_host_header_loop "$upstream_host")
     fi
+    acme_email=""
+    needs_cert=0
     if [ "$mode" = "public" ]; then
         require_cf_api_token || return 1
-        listen_port=$(read_input "公网 HTTPS 入站监听端口，例如 2053 或 52443" "${LISTEN_PORT:-52443}")
-        if ! validate_port "$listen_port" || [ "$listen_port" = "80" ]; then
-            err "HTTPS 监听端口不合法，且不能使用 80。"
-            return 1
-        fi
+        listen_port=$(read_port_loop "公网 HTTPS 入站监听端口，例如 2053 或 52443" "${LISTEN_PORT:-52443}")
         choose_public_dns_settings "$listen_port" "${PUBLIC_DNS_PROXIED:-0}" "${PUBLIC_IPV4:-}" "${PUBLIC_IPV6:-}" || return 1
         if [ "$new_hostname" != "$old_hostname" ] || [ "$old_mode" != "public" ] || [ ! -s "$CERT_HOME/$new_hostname/fullchain.cer" ] || [ ! -s "$CERT_HOME/$new_hostname/private.key" ]; then
             acme_email=$(read_input "ACME 账户邮箱（留空自动生成）" "")
-            issue_cloudflare_cert "$new_hostname" "$acme_email" || return 1
+            needs_cert=1
         fi
         service=""
     else
         require_config || return 1
+    fi
+
+    confirm_site_operation "修改反代" "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port" "$public_dns_proxied" "$public_ipv4" "$public_ipv6" "${acme_email:-}" || return 0
+    if [ "$needs_cert" = 1 ]; then
+        say "申请或安装 HTTPS 证书。"
+        issue_cloudflare_cert "$new_hostname" "$acme_email" || return 1
     fi
 
     backup_managed_files
@@ -1848,16 +2031,14 @@ edit_site() {
     fi
 }
 
-delete_site() {
-    need_root
-    load_config
-    select_site_file || return 1
-    f="$SELECTED_SITE_FILE"
+delete_site_file() {
+    f="$1"
+    [ -f "$f" ] || { err "站点记录不存在：$f"; return 1; }
     HOSTNAME= TARGET= MODE= PUBLIC_DNS_PROXIED= PUBLIC_IPV4= PUBLIC_IPV6=
     # shellcheck disable=SC1090
     . "$f"
     old_mode="$MODE"
-    say "将删除：$HOSTNAME -> $TARGET"
+    say "将删除：$HOSTNAME -> $TARGET [$(mode_label "$old_mode")]"
     if [ "$old_mode" = "public" ]; then
         require_cf_api_token || return 1
         confirm "确认删除该公网入站反代及 Cloudflare A/AAAA DNS？证书文件会保留。" || return 0
@@ -1885,6 +2066,21 @@ delete_site() {
     say "删除完成：$HOSTNAME"
 }
 
+delete_site_by_host() {
+    need_root
+    load_config
+    hostname="$1"
+    validate_hostname "$hostname" || { err "域名格式不正确。"; return 1; }
+    delete_site_file "$(site_env_path "$hostname")"
+}
+
+delete_site() {
+    need_root
+    load_config
+    select_site_file || return 1
+    delete_site_file "$SELECTED_SITE_FILE"
+}
+
 print_service_status_line() {
     label="$1"
     svc="$2"
@@ -1909,6 +2105,48 @@ site_count() {
     printf '%s' "$count"
 }
 
+public_site_count() {
+    count=0
+    for f in "$SITES_DIR"/*.env; do
+        [ -f "$f" ] || continue
+        MODE=
+        # shellcheck disable=SC1090
+        . "$f"
+        [ "$MODE" = "public" ] && count=$((count + 1))
+    done
+    printf '%s' "$count"
+}
+
+tunnel_site_count() {
+    count=0
+    for f in "$SITES_DIR"/*.env; do
+        [ -f "$f" ] || continue
+        MODE=
+        # shellcheck disable=SC1090
+        . "$f"
+        [ "$MODE" = "public" ] || count=$((count + 1))
+    done
+    printf '%s' "$count"
+}
+
+nginx_config_status() {
+    if ! has_cmd nginx; then
+        ui_bad '未安装'
+    elif nginx -t >/dev/null 2>&1; then
+        ui_ok '通过'
+    else
+        ui_bad '失败'
+    fi
+}
+
+cloudflared_log_hint() {
+    if [ -f "$CLOUDFLARED_LOG" ] && tail -n 80 "$CLOUDFLARED_LOG" 2>/dev/null | grep -Ei 'error|failed|bad gateway|unauthorized|forbidden' >/dev/null 2>&1; then
+        ui_warn '最近有错误'
+    else
+        ui_ok '无明显错误'
+    fi
+}
+
 show_status_card() {
     ui_section "服务状态"
     print_service_status_line nginx nginx nginx
@@ -1920,7 +2158,21 @@ show_status_card() {
         ui_warn '未配置'
         printf '\n'
     fi
-    printf '  %-12s: %s 个\n' "反代站点" "$(site_count)"
+    printf '  %-12s: ' "Nginx配置"
+    nginx_config_status
+    printf '\n'
+    printf '  %-12s: %s\n' "本机Nginx" "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
+    if [ -n "${CF_TUNNEL_ID:-}" ]; then
+        printf '  %-12s: %s\n' "Tunnel ID" "$CF_TUNNEL_ID"
+        printf '  %-12s: ' "Tunnel日志"
+        cloudflared_log_hint
+        printf '\n'
+    else
+        printf '  %-12s: ' "Tunnel ID"
+        ui_warn '未配置'
+        printf '\n'
+    fi
+    printf '  %-12s: %s 个（Tunnel %s / Public %s）\n' "反代站点" "$(site_count)" "$(tunnel_site_count)" "$(public_site_count)"
     printf '\n'
 }
 
@@ -2016,9 +2268,10 @@ uninstall_manager() {
     say "卸载前备份：$uninstall_backup"
 }
 
-local_test_site() {
-    hostname=$(read_input "要测试的 Host" "")
-    [ -n "$hostname" ] || return 1
+local_test_site_host() {
+    load_config
+    hostname="$1"
+    validate_hostname "$hostname" || { err "域名格式不正确。"; return 1; }
     site_file=$(site_env_path "$hostname")
     if [ -f "$site_file" ]; then
         MODE= TARGET= LISTEN_PORT=
@@ -2035,6 +2288,11 @@ local_test_site() {
     fi
     service_url=$(nginx_service_url "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}") || return 1
     curl -I -H "Host: $hostname" "$service_url/"
+}
+
+local_test_site() {
+    hostname=$(read_hostname_loop "要测试的 Host" "")
+    local_test_site_host "$hostname"
 }
 
 manage_services() {
