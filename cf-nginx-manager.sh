@@ -633,7 +633,7 @@ start_pre() {
         eerror "CF_TUNNEL_TOKEN is empty. Configure /etc/cf-nginx-manager/config.env first."
         return 1
     fi
-    command_args="tunnel run --token \${CF_TUNNEL_TOKEN}"
+    command_args="tunnel --no-autoupdate run --token \${CF_TUNNEL_TOKEN}"
 }
 
 depend() {
@@ -2166,11 +2166,24 @@ delete_site() {
     delete_site_file "$SELECTED_SITE_FILE"
 }
 
+print_status_prefix() {
+    case "$1" in
+        nginx) printf '  nginx       : ' ;;
+        cloudflared) printf '  cloudflared : ' ;;
+        Nginx配置) printf '  Nginx 配置  : ' ;;
+        本机Nginx) printf '  本机 Nginx  : ' ;;
+        'Tunnel ID') printf '  Tunnel ID   : ' ;;
+        Tunnel日志) printf '  Tunnel 日志 : ' ;;
+        反代站点) printf '  反代站点    : ' ;;
+        *) printf '  %s: ' "$1" ;;
+    esac
+}
+
 print_service_status_line() {
     label="$1"
     svc="$2"
     cmd="${3:-$2}"
-    printf '  %-12s: ' "$label"
+    print_status_prefix "$label"
     if ! has_cmd "$cmd"; then
         ui_bad '未安装'
     elif rc-service "$svc" status >/dev/null 2>&1; then
@@ -2239,25 +2252,28 @@ show_status_card() {
     if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
         print_service_status_line cloudflared cloudflared cloudflared
     else
-        printf '  %-12s: ' "cloudflared"
+        print_status_prefix "cloudflared"
         ui_warn '未配置'
         printf '\n'
     fi
-    printf '  %-12s: ' "Nginx配置"
+    print_status_prefix "Nginx配置"
     nginx_config_status
     printf '\n'
-    printf '  %-12s: %s\n' "本机Nginx" "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
+    print_status_prefix "本机Nginx"
+    printf '%s\n' "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
     if [ -n "${CF_TUNNEL_ID:-}" ]; then
-        printf '  %-12s: %s\n' "Tunnel ID" "$CF_TUNNEL_ID"
-        printf '  %-12s: ' "Tunnel日志"
+        print_status_prefix "Tunnel ID"
+        printf '%s\n' "$CF_TUNNEL_ID"
+        print_status_prefix "Tunnel日志"
         cloudflared_log_hint
         printf '\n'
     else
-        printf '  %-12s: ' "Tunnel ID"
+        print_status_prefix "Tunnel ID"
         ui_warn '未配置'
         printf '\n'
     fi
-    printf '  %-12s: %s 个（Tunnel %s / Public %s）\n' "反代站点" "$(site_count)" "$(tunnel_site_count)" "$(public_site_count)"
+    print_status_prefix "反代站点"
+    printf '%s 个（Tunnel %s / Public %s）\n' "$(site_count)" "$(tunnel_site_count)" "$(public_site_count)"
     printf '\n'
 }
 
