@@ -1934,8 +1934,7 @@ add_site_execute() {
         else
             say "[2/4] 生成并测试 Nginx 配置。"
         fi
-        render_site_nginx "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port"
-        if ! nginx_reload_safe; then
+        if ! render_site_nginx "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port" || ! nginx_reload_safe; then
             rollback_site_files "$change_backup" "$site_file" site_env "$site_conf" site_conf
             return $?
         fi
@@ -2128,16 +2127,19 @@ edit_site() {
         if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ] || [ "$old_mode" = "public" ]; then
             if ! nginx_reload_safe; then
                 rollback_site_files "$change_backup" "$old_site_file" old_site "$old_conf" old_conf "$new_site_file" new_site "$new_conf" new_conf
-                return $?
+                rc=$?
+                rm -f "$old_site_backup"
+                return "$rc"
             fi
         else
             reload_nginx_if_needed || warn "已有 Nginx 站点配置测试失败，请检查 Nginx 配置。"
         fi
     else
-        render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port"
-        if ! nginx_reload_safe; then
+        if ! render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port" || ! nginx_reload_safe; then
             rollback_site_files "$change_backup" "$old_site_file" old_site "$old_conf" old_conf "$new_site_file" new_site "$new_conf" new_conf
-            return $?
+            rc=$?
+            rm -f "$old_site_backup"
+            return "$rc"
         fi
     fi
     cleanup_change_backup "$change_backup"
