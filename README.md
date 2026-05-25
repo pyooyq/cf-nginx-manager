@@ -56,7 +56,7 @@ Public 入站模式：
 首次运行可以自动：
 
 - 安装 `nginx`、`curl`、`jq`、`cloudflared` 等依赖。
-- Alpine 3.21 默认仓库没有 `cloudflared` 时，临时使用 `edge/testing` 仓库安装。
+- Alpine 3.21 默认仓库没有 `cloudflared` 时，自动添加带标签的 HTTPS `edge/testing` 仓库，仅用于安装 `cloudflared`。
 - 保存 Cloudflare API Token，自动查询 Account ID / Zone ID，并可自动创建 Cloudflare Tunnel。
 - 创建 `cloudflared` 的 OpenRC 服务。
 - 设置 `nginx` 和 `cloudflared` 开机自启。
@@ -383,13 +383,13 @@ https://target.example.com
 这个模式会：
 
 - 不使用 Cloudflare Tunnel。
-- 让 Nginx 直接监听你输入的公网端口，例如 `52443`。
+- 让 Nginx 直接监听你输入的公网 HTTPS 端口，例如 `52443`。
 - 同一端口收到 HTTP 请求时会自动 301 跳转到 HTTPS。
 - 自动检测本机公网 IPv4，并创建或更新 Cloudflare A 记录。
 - 如果初始化时启用了 IPv6，可以选择检测并创建 AAAA 记录。
 - 可选择 DNS only 灰云或 Cloudflare 代理橙云；橙云只允许 Cloudflare 支持的 HTTPS 端口。
 - 如果已有 A/AAAA/CNAME 冲突记录，会提示确认是否覆盖。
-- 用 acme.sh 通过 Cloudflare DNS 验证申请 Let's Encrypt 证书。
+- 用 acme.sh 通过 Cloudflare DNS 验证申请 Let's Encrypt 证书，首次安装 acme.sh 前会提示确认远程安装脚本。
 - 把证书安装到 `/etc/nginx/certs/<域名>/`。
 - 通过 cron 自动续签，续签后自动 reload Nginx。
 

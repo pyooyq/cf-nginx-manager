@@ -17,6 +17,8 @@ SCRIPT_URL="https://raw.githubusercontent.com/pyooyq/cf-nginx-manager/main/cf-ng
 INSTALL_BIN="/usr/local/bin/cfp"
 LEGACY_BIN="/usr/local/bin/cf-nginx-manager"
 ASSUME_YES=0
+CLOUDFLARED_EDGE_REPO_TAG="@cf-nginx-manager-edge-testing"
+CLOUDFLARED_EDGE_REPO="https://dl-cdn.alpinelinux.org/alpine/edge/testing"
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
@@ -587,8 +589,18 @@ ensure_cloudflared() {
         return 0
     fi
 
-    say "临时使用 edge/testing 仓库安装 cloudflared。"
-    apk add --no-cache --repository http://dl-cdn.alpinelinux.org/alpine/edge/testing cloudflared
+    if grep -q '^http://dl-cdn.alpinelinux.org/alpine/edge/testing$' /etc/apk/repositories 2>/dev/null; then
+        warn "移除旧的未加标签 HTTP edge/testing 仓库条目。"
+        sed -i '\#^http://dl-cdn.alpinelinux.org/alpine/edge/testing$#d' /etc/apk/repositories
+    fi
+
+    tagged_repo="$CLOUDFLARED_EDGE_REPO_TAG $CLOUDFLARED_EDGE_REPO"
+    if ! grep -Fqx "$tagged_repo" /etc/apk/repositories 2>/dev/null; then
+        say "追加带标签的 edge/testing 仓库，仅用于安装 cloudflared。"
+        printf '%s\n' "$tagged_repo" >> /etc/apk/repositories
+    fi
+
+    apk update && apk add --no-cache "cloudflared$CLOUDFLARED_EDGE_REPO_TAG"
 }
 
 install_dependencies() {
@@ -808,6 +820,8 @@ ensure_acme_ready() {
     email="$1"
     [ -n "$email" ] || email=$(random_acme_email)
     if [ ! -x "$ACME_HOME/acme.sh" ]; then
+        warn "将从 https://get.acme.sh 下载并以 root 执行 acme.sh 官方安装脚本。"
+        confirm "是否继续安装 acme.sh？" || return 1
         say "安装 acme.sh..."
         tmp=$(mktemp)
         if ! curl -fsSL https://get.acme.sh -o "$tmp"; then
@@ -1208,6 +1222,54 @@ backup_managed_files() {
     mkdir -p "$dst/nginx" "$dst/sites"
     copy_existing_files "$dst/nginx" "$NGINX_MAP_FILE" "$NGINX_PREFIX"*.conf
     copy_existing_files "$dst/sites" "$SITES_DIR"/*.env
+}
+
+snapshot_file() {
+    src="$1"
+    label="$2"
+    backup_dir="$3"
+    if [ -f "$src" ]; then
+        cp "$src" "$backup_dir/$label" || return 1
+        printf '1\n' > "$backup_dir/$label.exists" || return 1
+    else
+        printf '0\n' > "$backup_dir/$label.exists" || return 1
+    fi
+}
+
+restore_file_snapshot() {
+    dst="$1"
+    label="$2"
+    backup_dir="$3"
+    state=$(cat "$backup_dir/$label.exists" 2>/dev/null) || return 1
+    case "$state" in
+        1) cp "$backup_dir/$label" "$dst" || return 1 ;;
+        0) rm -f "$dst" || return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
+cleanup_change_backup() {
+    backup_dir="$1"
+    [ -n "$backup_dir" ] && rm -rf "$backup_dir"
+}
+
+rollback_site_files() {
+    backup_dir="$1"
+    shift
+    failed=0
+    while [ "$#" -gt 0 ]; do
+        restore_file_snapshot "$1" "$2" "$backup_dir" || failed=1
+        shift 2
+    done
+
+    if [ "$failed" = 0 ]; then
+        nginx_reload_safe >/dev/null 2>&1 || warn "回滚后 Nginx 仍测试失败，请检查现有配置。"
+        cleanup_change_backup "$backup_dir"
+        err "Nginx 配置测试失败，已回滚本次站点文件变更。"
+    else
+        err "Nginx 配置测试失败，且回滚本次站点文件变更失败。快照保留在 $backup_dir。"
+    fi
+    return 1
 }
 
 nginx_reload_safe() {
@@ -1644,7 +1706,12 @@ cf_sync_ingress() {
     current=$(cf_get_tunnel_config) || return 1
     managed_hosts=$(managed_hostnames_json)
     managed_ingress=$(managed_ingress_json)
-    body=$(printf '%s' "$current" | jq -c         --argjson managedHosts "$managed_hosts"         --argjson managedIngress "$managed_ingress"         '{config:((.result.config // {}) | .ingress = (((.ingress // []) | map(select((.hostname // "") as $h | ($managedHosts | index($h) | not))) | map(select(.service != "http_status:404")) + $managedIngress + [{service:"http_status:404"}])))}') || return 1
+    body=$(printf '%s' "$current" | jq -c \
+        --argjson managedHosts "$managed_hosts" \
+        --argjson managedIngress "$managed_ingress" \
+        '(.result.config // {}) as $config
+        | ($config.ingress // []) as $ingress
+        | {config:($config + {ingress:(($ingress | map(select((.hostname // "") as $h | ($managedHosts | index($h) | not))) | map(select(.service != "http_status:404")) + $managedIngress + [{service:"http_status:404"}])})}') || return 1
     say "同步 Cloudflare DNS 和 Tunnel ingress。"
     response=$(cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body") || return 1
     cf_api_success "$response"
@@ -1654,7 +1721,11 @@ cf_remove_ingress_hostname() {
     hostname="$1"
     require_config || return 1
     current=$(cf_get_tunnel_config) || return 1
-    body=$(printf '%s' "$current" | jq -c         --arg hostname "$hostname"         '{config:((.result.config // {}) | .ingress = (((.ingress // []) | map(select((.hostname // "") != $hostname)) | map(select(.service != "http_status:404")) + [{service:"http_status:404"}])))}') || return 1
+    body=$(printf '%s' "$current" | jq -c \
+        --arg hostname "$hostname" \
+        '(.result.config // {}) as $config
+        | ($config.ingress // []) as $ingress
+        | {config:($config + {ingress:(($ingress | map(select((.hostname // "") != $hostname)) | map(select(.service != "http_status:404"))) + [{service:"http_status:404"}])})}') || return 1
     say "移除 Cloudflare Tunnel ingress：$hostname"
     response=$(cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body") || return 1
     cf_api_success "$response"
@@ -1843,25 +1914,33 @@ add_site_execute() {
     else
         say "[1/4] 备份并写入本地站点记录。"
     fi
+    change_backup=$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}.XXXXXX") || return 1
+    site_file=$(site_env_path "$hostname")
+    site_conf=$(site_conf_path "$hostname")
+    if ! snapshot_file "$site_file" site_env "$change_backup" || ! snapshot_file "$site_conf" site_conf "$change_backup"; then
+        cleanup_change_backup "$change_backup"
+        err "创建站点变更快照失败。"
+        return 1
+    fi
     backup_managed_files
     save_site_env "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port" "$public_dns_proxied" "$public_ipv4" "$public_ipv6"
 
     if [ "$mode" = "direct" ]; then
         say "[2/4] Tunnel 直连模式不生成 Nginx 配置。"
-        rm -f "$(site_conf_path "$hostname")"
+        rm -f "$site_conf"
     else
         if [ "$mode" = "public" ]; then
             say "[3/5] 生成并测试 Nginx 配置。"
         else
             say "[2/4] 生成并测试 Nginx 配置。"
         fi
-        if ! render_site_nginx "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port" || ! nginx_reload_safe; then
-            rm -f "$(site_conf_path "$hostname")" "$(site_env_path "$hostname")"
-            err "Nginx 配置测试失败，已回滚本次新增。"
-            return 1
+        render_site_nginx "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port"
+        if ! nginx_reload_safe; then
+            rollback_site_files "$change_backup" "$site_file" site_env "$site_conf" site_conf
+            return $?
         fi
     fi
-
+    cleanup_change_backup "$change_backup"
     if [ "$mode" = "public" ]; then
         say "[4/5] 更新 Cloudflare A/AAAA DNS。"
         if ! cf_upsert_public_dns "$hostname" "$public_ipv4" "$public_ipv6" "$public_dns_proxied"; then
@@ -2025,6 +2104,18 @@ edit_site() {
         issue_cloudflare_cert "$new_hostname" "$acme_email" || return 1
     fi
 
+    change_backup=$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}.XXXXXX") || return 1
+    old_site_file="$f"
+    new_site_file=$(site_env_path "$new_hostname")
+    new_conf=$(site_conf_path "$new_hostname")
+    if ! snapshot_file "$old_site_file" old_site "$change_backup" \
+        || ! snapshot_file "$old_conf" old_conf "$change_backup" \
+        || ! snapshot_file "$new_site_file" new_site "$change_backup" \
+        || ! snapshot_file "$new_conf" new_conf "$change_backup"; then
+        cleanup_change_backup "$change_backup"
+        err "创建站点变更快照失败。"
+        return 1
+    fi
     backup_managed_files
     old_site_backup=$(mktemp)
     cp "$f" "$old_site_backup" 2>/dev/null || true
@@ -2033,34 +2124,23 @@ edit_site() {
     fi
     save_site_env "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$service" "$listen_port" "$public_dns_proxied" "$public_ipv4" "$public_ipv6"
     if [ "$mode" = "direct" ]; then
-        rm -f "$(site_conf_path "$new_hostname")"
+        rm -f "$new_conf"
         if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ] || [ "$old_mode" = "public" ]; then
             if ! nginx_reload_safe; then
-                rm -f "$(site_env_path "$new_hostname")" "$(site_conf_path "$new_hostname")"
-                restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
-                reload_nginx_if_needed >/dev/null 2>&1 || true
-                rm -f "$old_site_backup"
-                err "Nginx 配置测试失败，已尝试回滚本次修改。"
-                return 1
+                rollback_site_files "$change_backup" "$old_site_file" old_site "$old_conf" old_conf "$new_site_file" new_site "$new_conf" new_conf
+                return $?
             fi
-        elif ! reload_nginx_if_needed; then
-            rm -f "$(site_env_path "$new_hostname")" "$(site_conf_path "$new_hostname")"
-            restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
-            reload_nginx_if_needed >/dev/null 2>&1 || true
-            rm -f "$old_site_backup"
-            err "Nginx 配置测试失败，已尝试回滚本次修改。"
-            return 1
+        else
+            reload_nginx_if_needed || warn "已有 Nginx 站点配置测试失败，请检查 Nginx 配置。"
         fi
     else
-        if ! render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port" || ! nginx_reload_safe; then
-            rm -f "$(site_conf_path "$new_hostname")" "$(site_env_path "$new_hostname")"
-            restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
-            reload_nginx_if_needed >/dev/null 2>&1 || true
-            rm -f "$old_site_backup"
-            err "Nginx 配置测试失败，已尝试回滚本次修改。"
-            return 1
+        render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port"
+        if ! nginx_reload_safe; then
+            rollback_site_files "$change_backup" "$old_site_file" old_site "$old_conf" old_conf "$new_site_file" new_site "$new_conf" new_conf
+            return $?
         fi
     fi
+    cleanup_change_backup "$change_backup"
     if [ "$old_mode" != "public" ] && [ "$mode" != "public" ]; then
         :
     fi
