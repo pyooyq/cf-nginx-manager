@@ -267,6 +267,11 @@ load_config() {
         . "$CONFIG_ENV"
     fi
     LOCAL_SERVICE="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
+    # 兼容不带 scheme 的 HOST:PORT，统一补齐 http://。
+    case "$LOCAL_SERVICE" in
+        *://*) ;;
+        *) LOCAL_SERVICE="http://$LOCAL_SERVICE" ;;
+    esac
     case "${UPSTREAM_IPV6:-0}" in
         1|true|TRUE|yes|YES|on|ON) UPSTREAM_IPV6=1 ;;
         *) UPSTREAM_IPV6=0 ;;
@@ -612,6 +617,23 @@ install_dependencies() {
         warn "未检测到 /etc/alpine-release，本脚本主要面向 Alpine/OpenRC。"
     fi
 
+    # 先检测是否已安装；全部就绪则跳过 apk update / 下载。
+    missing=""
+    has_cmd nginx || missing="$missing nginx"
+    has_cmd curl || missing="$missing curl"
+    has_cmd update-ca-certificates || missing="$missing ca-certificates"
+    has_cmd openssl || missing="$missing openssl"
+    has_cmd rc-service || missing="$missing openrc"
+    has_cmd jq || missing="$missing jq"
+    has_cmd crond || missing="$missing dcron"
+    has_cmd cloudflared || missing="$missing cloudflared"
+
+    if [ -z "$missing" ]; then
+        say "所需依赖已全部安装，跳过。"
+        return 0
+    fi
+
+    say "缺少依赖：$(printf '%s' "$missing" | sed 's/^ //')，开始安装..."
     apk update
     ensure_package nginx nginx || return 1
     ensure_package curl curl || return 1
@@ -766,6 +788,11 @@ validate_http_target() {
 
 nginx_service_url() {
     service="${1:-$LOCAL_SERVICE_DEFAULT}"
+    # 允许不写 scheme 的 HOST:PORT（本机 Nginx 固定走 http）。
+    case "$service" in
+        *://*) ;;
+        *) service="http://$service" ;;
+    esac
     scheme=$(target_scheme "$service")
     authority=$(target_authority "$service")
     path_prefix=$(target_path_prefix "$service")
@@ -796,8 +823,8 @@ read_nginx_service_loop() {
     default="${2:-$LOCAL_SERVICE_DEFAULT}"
     while :; do
         value=$(read_input "$prompt" "$default")
-        if nginx_service_url "$value" >/dev/null; then
-            printf '%s' "$value"
+        if service_url=$(nginx_service_url "$value"); then
+            printf '%s' "$service_url"
             return 0
         fi
     done
