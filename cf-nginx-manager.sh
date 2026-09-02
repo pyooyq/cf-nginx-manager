@@ -1721,7 +1721,11 @@ cf_sync_ingress() {
         --argjson managedIngress "$managed_ingress" \
         '(.result.config // {}) as $config
         | ($config.ingress // []) as $ingress
-        | {config:($config + {ingress:(($ingress | map(select((.hostname // "") as $h | ($managedHosts | index($h) | not))) | map(select(.service != "http_status:404")) + $managedIngress + [{service:"http_status:404"}])})}') || return 1
+        | ($ingress
+            | map(select((.hostname // "") as $h | ($managedHosts | index($h) | not)))
+            | map(select(.service != "http_status:404"))
+            | . + $managedIngress + [{service:"http_status:404"}]) as $newIngress
+        | {config: ($config + {ingress: $newIngress})}') || return 1
     say "同步 Cloudflare DNS 和 Tunnel ingress。"
     response=$(cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body") || return 1
     cf_api_success "$response"
@@ -1735,7 +1739,11 @@ cf_remove_ingress_hostname() {
         --arg hostname "$hostname" \
         '(.result.config // {}) as $config
         | ($config.ingress // []) as $ingress
-        | {config:($config + {ingress:(($ingress | map(select((.hostname // "") != $hostname)) | map(select(.service != "http_status:404"))) + [{service:"http_status:404"}])})}') || return 1
+        | ($ingress
+            | map(select((.hostname // "") != $hostname))
+            | map(select(.service != "http_status:404"))
+            | . + [{service:"http_status:404"}]) as $newIngress
+        | {config: ($config + {ingress: $newIngress})}') || return 1
     say "移除 Cloudflare Tunnel ingress：$hostname"
     response=$(cf_api PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$CF_TUNNEL_ID/configurations" "$body") || return 1
     cf_api_success "$response"
