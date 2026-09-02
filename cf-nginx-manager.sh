@@ -459,12 +459,16 @@ create_new_cloudflare_tunnel() {
 configure_cloudflare_tunnel() {
     if [ -n "${CF_TUNNEL_ID:-}" ]; then
         say "当前已保存 Tunnel：$CF_TUNNEL_ID"
-        printf '%s\n' "1) 创建新的独立 Tunnel（推荐：每台 VPS 一个 Tunnel）" >/dev/tty
-        printf '%s\n' "2) 沿用当前 Tunnel" >/dev/tty
+        printf '%s\n' "1) 沿用当前 Tunnel（推荐，回车确认）" >/dev/tty
+        printf '%s\n' "2) 创建新的独立 Tunnel（每台 VPS 一个 Tunnel）" >/dev/tty
         printf '选择 [1]: ' >/dev/tty
         IFS= read -r choice </dev/tty
         case "$choice" in
             2)
+                CF_TUNNEL_ID=""
+                CF_TUNNEL_TOKEN=""
+                ;;
+            *)
                 if [ -z "${CF_TUNNEL_TOKEN:-}" ]; then
                     say "获取当前 Tunnel Token：$CF_TUNNEL_ID"
                     CF_TUNNEL_TOKEN=$(cloudflare_tunnel_token "$CF_TUNNEL_ID") || return 1
@@ -474,8 +478,6 @@ configure_cloudflare_tunnel() {
                 return 0
                 ;;
         esac
-        CF_TUNNEL_ID=""
-        CF_TUNNEL_TOKEN=""
     fi
     create_new_cloudflare_tunnel
 }
@@ -1016,9 +1018,14 @@ cloudflare_https_port_supported() {
 validate_nginx_value() {
     value="$1"
     case "$value" in
-        ''|*' '*|*';'*|*'{'*|*'}'*|*'`'*|*'$'*|*'"'*|*'\\'*|*'\n'*|*'\r'*) return 1 ;;
-        *) return 0 ;;
+        ''|*' '*|*';'*|*'{'*|*'}'*|*'`'*|*'$'*|*'"'*) return 1 ;;
     esac
+    # Reject a lone backslash (nginx treats it as an escape in directive strings)
+    # and any non-printable character (newline/CR/tab would split a directive).
+    case "$value" in
+        *\\*|*[![:print:]]*) return 1 ;;
+    esac
+    return 0
 }
 
 validate_proxy_path() {
@@ -1095,6 +1102,13 @@ render_site_nginx() {
     [ -n "$custom_host" ] && host_header="$custom_host"
 
     tmp="$conf.tmp"
+    if [ "$mode" = "public" ]; then
+        if [ "$listen_port" = "443" ]; then
+            public_redirect_base="https://$hostname"
+        else
+            public_redirect_base="https://$hostname:$listen_port"
+        fi
+    fi
     {
         printf 'server {\n'
         if [ "$mode" = "public" ]; then
@@ -1109,11 +1123,6 @@ render_site_nginx() {
             printf '    ssl_certificate_key %s/private.key;\n' "$cert_dir"
             printf '    ssl_session_cache shared:%s:10m;\n' "$ssl_cache_zone"
             printf '    ssl_session_timeout 10m;\n'
-            if [ "$listen_port" = "443" ]; then
-                public_redirect_base="https://$hostname"
-            else
-                public_redirect_base="https://$hostname:$listen_port"
-            fi
             printf '    ssl_protocols TLSv1.2 TLSv1.3;\n'
             printf '    ssl_prefer_server_ciphers off;\n'
             printf '    error_page 497 =301 %s$request_uri;\n\n' "$public_redirect_base"
@@ -1254,8 +1263,9 @@ cleanup_change_backup() {
 }
 
 rollback_site_files() {
-    backup_dir="$1"
-    shift
+    message="$1"
+    backup_dir="$2"
+    shift 2
     failed=0
     while [ "$#" -gt 0 ]; do
         restore_file_snapshot "$1" "$2" "$backup_dir" || failed=1
@@ -1265,9 +1275,9 @@ rollback_site_files() {
     if [ "$failed" = 0 ]; then
         nginx_reload_safe >/dev/null 2>&1 || warn "回滚后 Nginx 仍测试失败，请检查现有配置。"
         cleanup_change_backup "$backup_dir"
-        err "Nginx 配置测试失败，已回滚本次站点文件变更。"
+        err "$message"
     else
-        err "Nginx 配置测试失败，且回滚本次站点文件变更失败。快照保留在 $backup_dir。"
+        err "回滚失败（$message）。快照保留在 $backup_dir。"
     fi
     return 1
 }
@@ -1795,20 +1805,6 @@ choose_host_header() {
     esac
 }
 
-restore_site_from_file() {
-    backup_file="$1"
-    [ -f "$backup_file" ] || return 1
-    HOSTNAME= TARGET= MODE= UPSTREAM_HOST= CUSTOM_HOST= LISTEN_PORT= PUBLIC_DNS_PROXIED= PUBLIC_IPV4= PUBLIC_IPV6=
-    # shellcheck disable=SC1090
-    . "$backup_file"
-    [ -n "$HOSTNAME" ] || return 1
-    cp "$backup_file" "$(site_env_path "$HOSTNAME")"
-    case "$MODE" in
-        proxy|mirror|cfcdn|public) render_site_nginx "$HOSTNAME" "$TARGET" "$MODE" "$UPSTREAM_HOST" "$CUSTOM_HOST" "$LISTEN_PORT" >/dev/null 2>&1 || true ;;
-        direct) rm -f "$(site_conf_path "$HOSTNAME")" ;;
-    esac
-}
-
 rollback_new_site() {
     hostname="$1"
     rm -f "$(site_conf_path "$hostname")" "$(site_env_path "$hostname")"
@@ -1935,7 +1931,7 @@ add_site_execute() {
             say "[2/4] 生成并测试 Nginx 配置。"
         fi
         if ! render_site_nginx "$hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port" || ! nginx_reload_safe; then
-            rollback_site_files "$change_backup" "$site_file" site_env "$site_conf" site_conf
+            rollback_site_files "Nginx 配置测试失败，已回滚本次站点文件变更。" "$change_backup" "$site_file" site_env "$site_conf" site_conf
             return $?
         fi
     fi
@@ -1978,7 +1974,7 @@ add_site() {
     acme_email=""
     if [ "$mode" = "direct" ]; then
         service="$target"
-    elif [ "$mode" = "cfcdn" ] || [ "$mode" = "public" ]; then
+    elif [ "$mode" = "cfcdn" ]; then
         custom_host="$upstream_host"
     else
         custom_host=$(read_host_header_loop "$upstream_host")
@@ -2077,8 +2073,6 @@ edit_site() {
         service="$target"
     elif [ "$mode" = "cfcdn" ]; then
         custom_host="$upstream_host"
-    elif [ "$mode" = "public" ]; then
-        custom_host="$upstream_host"
     else
         custom_host=$(read_host_header_loop "$upstream_host")
     fi
@@ -2116,8 +2110,6 @@ edit_site() {
         return 1
     fi
     backup_managed_files
-    old_site_backup=$(mktemp)
-    cp "$f" "$old_site_backup" 2>/dev/null || true
     if [ "$new_hostname" != "$old_hostname" ]; then
         rm -f "$old_conf" "$f"
     fi
@@ -2126,50 +2118,37 @@ edit_site() {
         rm -f "$new_conf"
         if [ "$old_mode" = "proxy" ] || [ "$old_mode" = "mirror" ] || [ "$old_mode" = "cfcdn" ] || [ "$old_mode" = "public" ]; then
             if ! nginx_reload_safe; then
-                rollback_site_files "$change_backup" "$old_site_file" old_site "$old_conf" old_conf "$new_site_file" new_site "$new_conf" new_conf
-                rc=$?
-                rm -f "$old_site_backup"
-                return "$rc"
+                rollback_site_files "Nginx 配置测试失败，已回滚本次修改。" "$change_backup" "$old_site_file" old_site "$old_conf" old_conf "$new_site_file" new_site "$new_conf" new_conf
+                return $?
             fi
         else
             reload_nginx_if_needed || warn "已有 Nginx 站点配置测试失败，请检查 Nginx 配置。"
         fi
     else
         if ! render_site_nginx "$new_hostname" "$target" "$mode" "$upstream_host" "$custom_host" "$listen_port" || ! nginx_reload_safe; then
-            rollback_site_files "$change_backup" "$old_site_file" old_site "$old_conf" old_conf "$new_site_file" new_site "$new_conf" new_conf
-            rc=$?
-            rm -f "$old_site_backup"
-            return "$rc"
+            rollback_site_files "Nginx 配置测试失败，已回滚本次修改。" "$change_backup" "$old_site_file" old_site "$old_conf" old_conf "$new_site_file" new_site "$new_conf" new_conf
+            return $?
         fi
     fi
-    cleanup_change_backup "$change_backup"
-    if [ "$old_mode" != "public" ] && [ "$mode" != "public" ]; then
-        :
-    fi
+
     if [ "$mode" = "public" ]; then
         if ! cf_upsert_public_dns "$new_hostname" "$public_ipv4" "$public_ipv6" "$public_dns_proxied"; then
-            rm -f "$(site_conf_path "$new_hostname")" "$(site_env_path "$new_hostname")"
-            restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
-            reload_nginx_if_needed >/dev/null 2>&1 || true
-            rm -f "$old_site_backup"
-            err "Cloudflare 公网 DNS 配置失败，已尝试回滚本次修改。"
-            return 1
+            rollback_site_files "Cloudflare 公网 DNS 配置失败，已回滚本次修改。" "$change_backup" "$old_site_file" old_site "$old_conf" old_conf "$new_site_file" new_site "$new_conf" new_conf
+            return $?
         fi
         if [ "$old_mode" != "public" ]; then
             if ! cf_remove_ingress_hostname "$old_hostname" || ! cf_delete_dns "$old_hostname"; then
+                # 旧入口可能在 Cloudflare 侧已被移除：删掉新加的公网 DNS，回滚本地文件，再重新同步恢复旧入口。
                 cf_delete_public_dns "$new_hostname" "$public_ipv4" "$public_ipv6" "$public_dns_proxied" >/dev/null 2>&1 || true
-                rm -f "$(site_conf_path "$new_hostname")" "$(site_env_path "$new_hostname")"
-                restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
-                reload_nginx_if_needed >/dev/null 2>&1 || true
+                rollback_site_files "Cloudflare 旧入口清理失败，已回滚本次修改。" "$change_backup" "$old_site_file" old_site "$old_conf" old_conf "$new_site_file" new_site "$new_conf" new_conf
+                rc=$?
                 cf_sync_ingress >/dev/null 2>&1 || true
-                rm -f "$old_site_backup"
-                err "Cloudflare 旧入口清理失败，已尝试回滚本次修改。"
-                return 1
+                return "$rc"
             fi
         elif [ "$new_hostname" != "$old_hostname" ]; then
             cf_delete_public_dns "$old_hostname" "$old_public_ipv4" "$old_public_ipv6" "$old_public_dns_proxied" || warn "旧公网 DNS 删除失败：$old_hostname，请手动检查。"
         fi
-        rm -f "$old_site_backup"
+        cleanup_change_backup "$change_backup"
         say "修改完成：https://$new_hostname:$listen_port -> $target [public]"
         say "请确认防火墙/安全组已放行 TCP $listen_port。"
     else
@@ -2179,21 +2158,19 @@ edit_site() {
         if ! cf_sync_ingress; then
             cf_delete_dns "$new_hostname" >/dev/null 2>&1 || true
             cf_remove_ingress_hostname "$new_hostname" >/dev/null 2>&1 || true
-            rm -f "$(site_conf_path "$new_hostname")" "$(site_env_path "$new_hostname")"
-            restore_site_from_file "$old_site_backup" >/dev/null 2>&1 || true
-            reload_nginx_if_needed >/dev/null 2>&1 || true
             if [ "$old_mode" = "public" ] && [ -n "$old_public_ipv4" ]; then
                 cf_upsert_public_dns "$old_hostname" "$old_public_ipv4" "$old_public_ipv6" "$old_public_dns_proxied" >/dev/null 2>&1 || true
             fi
-            rm -f "$old_site_backup"
-            err "Cloudflare 同步失败，已尝试回滚本次修改。"
-            return 1
+            rollback_site_files "Cloudflare 同步失败，已回滚本次修改。" "$change_backup" "$old_site_file" old_site "$old_conf" old_conf "$new_site_file" new_site "$new_conf" new_conf
+            rc=$?
+            cf_sync_ingress >/dev/null 2>&1 || true
+            return "$rc"
         fi
         if [ "$new_hostname" != "$old_hostname" ] && [ "$old_mode" != "public" ]; then
             cf_remove_ingress_hostname "$old_hostname" || warn "旧 Tunnel ingress 删除失败：$old_hostname，请手动检查。"
             cf_delete_dns "$old_hostname" || warn "旧 DNS 删除失败：$old_hostname，请手动检查。"
         fi
-        rm -f "$old_site_backup"
+        cleanup_change_backup "$change_backup"
         say "修改完成：https://$new_hostname -> $target [$mode]"
     fi
 }
@@ -2439,6 +2416,10 @@ uninstall_manager() {
     fi
     remove_existing_files "$NGINX_PREFIX"*.conf "$NGINX_MAP_FILE" "$CLOUDFLARED_INIT" "$CLOUDFLARED_LOG" "$INSTALL_BIN" "$LEGACY_BIN"
     rm -rf "$CONFIG_DIR" 2>/dev/null || true
+    # 移除本脚本可能追加到 /etc/apk/repositories 的带标签 edge/testing 仓库条目。
+    if [ -n "$CLOUDFLARED_EDGE_REPO_TAG" ]; then
+        sed -i "\#$CLOUDFLARED_EDGE_REPO_TAG#d" /etc/apk/repositories 2>/dev/null || true
+    fi
     if [ "$remove_cloudflared" = 1 ]; then
         remove_package_if_installed cloudflared cloudflared || warn "cloudflared 软件包卸载失败，请手动检查。"
     fi
@@ -2624,6 +2605,7 @@ parse_add_command() {
     public_ipv4=""
     public_ipv6=""
     acme_email=""
+    dns_mode_arg=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --host|-H) need_option_value "$1" "${2:-}" || return 1; hostname="$2"; shift 2 ;;
@@ -2633,8 +2615,14 @@ parse_add_command() {
             --listen-port|--port|-p) need_option_value "$1" "${2:-}" || return 1; listen_port="$2"; shift 2 ;;
             --ipv4) need_option_value "$1" "${2:-}" || return 1; public_ipv4="$2"; shift 2 ;;
             --ipv6) need_option_value "$1" "${2:-}" || return 1; public_ipv6="$2"; shift 2 ;;
-            --proxied) public_dns_proxied="1"; shift ;;
-            --dns-only) public_dns_proxied="0"; shift ;;
+            --proxied)
+                [ "$dns_mode_arg" = "dns-only" ] && { err "--proxied 与 --dns-only 不能同时使用。"; return 1; }
+                public_dns_proxied="1"; dns_mode_arg="proxied"; shift
+                ;;
+            --dns-only)
+                [ "$dns_mode_arg" = "proxied" ] && { err "--proxied 与 --dns-only 不能同时使用。"; return 1; }
+                public_dns_proxied="0"; dns_mode_arg="dns-only"; shift
+                ;;
             --acme-email) need_option_value "$1" "${2:-}" || return 1; acme_email="$2"; shift 2 ;;
             --yes|-y) ASSUME_YES=1; shift ;;
             --help|-h) print_help; return 0 ;;

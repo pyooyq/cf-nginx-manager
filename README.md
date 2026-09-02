@@ -536,6 +536,8 @@ cfp uninstall
 /usr/local/bin/cf-nginx-manager
 ```
 
+另外会移除脚本为安装 `cloudflared` 而追加到 `/etc/apk/repositories` 的带标签 edge/testing 仓库条目。
+
 卸载不会自动删除：
 
 - `nginx` / `cloudflared` 软件包。
