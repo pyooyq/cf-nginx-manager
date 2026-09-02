@@ -501,7 +501,16 @@ configure_credentials() {
         exit 1
     fi
     discover_cloudflare_ids || return 1
-    LOCAL_SERVICE=$(read_nginx_service_loop "本机 Nginx 服务地址" "${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}")
+    service_default="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
+    # 尚无站点（避免误判脚本自身 nginx 占用的端口）且默认端口已被占用时，自动建议一个空闲端口。
+    if [ "$(site_count)" = "0" ] && ! port_is_free "$(nginx_service_port "$service_default" 2>/dev/null || echo 8080)"; then
+        free_port=$(detect_free_local_port)
+        if [ -n "$free_port" ] && [ "$free_port" != "$(nginx_service_port "$service_default" 2>/dev/null || echo 8080)" ]; then
+            warn "本机 Nginx 端口 $(nginx_service_port "$service_default" 2>/dev/null || echo 8080) 已被占用，自动改用 $free_port。"
+            service_default="http://127.0.0.1:$free_port"
+        fi
+    fi
+    LOCAL_SERVICE=$(read_nginx_service_loop "本机 Nginx 服务地址" "$service_default")
     if confirm_default_no "是否启用 Nginx 上游 IPv6 解析？没有 IPv6 出口的 VPS 请保持关闭"; then
         UPSTREAM_IPV6=1
     else
@@ -833,6 +842,37 @@ read_nginx_service_loop() {
 nginx_listen_from_service() {
     service_url=$(nginx_service_url "$1") || return 1
     target_authority "$service_url"
+}
+
+nginx_service_port() {
+    authority=$(nginx_listen_from_service "$1" 2>/dev/null) || return 1
+    printf '%s' "$authority" | sed 's/^.*://; s/]//g'
+}
+
+port_is_free() {
+    port="$1"
+    case "$port" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    # 仅 Linux 有效：读 /proc/net/tcp[6] 的内核监听套接字判断端口是否被占用。
+    if [ ! -r /proc/net/tcp ]; then
+        return 0   # 无法判断时按空闲处理，避免误报阻塞。
+    fi
+    hex=$(printf '%04X' "$port" 2>/dev/null) || return 0
+    # awk 退出码：found（被占用）=0 表示端口非空闲；未找到=1 表示空闲。
+    { cat /proc/net/tcp 2>/dev/null; cat /proc/net/tcp6 2>/dev/null; } | \
+        awk -v h="$hex" 'NR>1 && $4=="0A"{split($2,a,":"); if(a[2]==h){found=1}} END{exit found?0:1}'
+    [ "$?" = 0 ] && return 1 || return 0
+}
+
+detect_free_local_port() {
+    for port in 8080 8081 8082 8090 8000 9000 3000; do
+        if port_is_free "$port"; then
+            printf '%s' "$port"
+            return 0
+        fi
+    done
+    printf '8080'
 }
 
 ensure_crond() {
