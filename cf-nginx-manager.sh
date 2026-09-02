@@ -491,6 +491,7 @@ configure_credentials() {
     need_root
     load_config
     old_api_token="${CF_API_TOKEN:-}"
+    old_local_service="${LOCAL_SERVICE:-$LOCAL_SERVICE_DEFAULT}"
     say "请输入 Cloudflare API Token，脚本会自动查询 Account ID 和 Zone ID。"
     CF_API_TOKEN=$(read_secret "Cloudflare API Token（输入不会回显，留空保留旧值）")
     if [ -z "$CF_API_TOKEN" ]; then
@@ -533,6 +534,23 @@ configure_credentials() {
         render_cloudflared_openrc
     fi
     say "配置已保存到 $CONFIG_ENV。"
+    # 本机 Nginx 地址变更后，自动重新生成依赖它的站点配置并同步 Tunnel ingress。
+    if [ "$LOCAL_SERVICE" != "$old_local_service" ] && has_cmd nginx && has_tunnel_nginx_site; then
+        backup_managed_files
+        if rerender_nginx_sites; then
+            if nginx_reload_safe; then
+                if cf_sync_ingress; then
+                    say "本机 Nginx 地址已变更，已重新生成站点配置并同步 Tunnel ingress。"
+                else
+                    warn "站点配置已重新生成，但 Tunnel ingress 同步失败，请稍后执行 cfp sync。"
+                fi
+            else
+                warn "站点配置已重新生成，但 Nginx 测试/重载失败，请检查 nginx -t。"
+            fi
+        else
+            err "重新生成站点 Nginx 配置失败，请检查站点记录。"
+        fi
+    fi
 }
 
 require_config() {
@@ -1376,6 +1394,39 @@ reload_nginx_if_needed() {
     else
         return 0
     fi
+}
+
+has_tunnel_nginx_site() {
+    for f in "$SITES_DIR"/*.env; do
+        [ -f "$f" ] || continue
+        MODE=
+        # shellcheck disable=SC1090
+        . "$f"
+        case "$MODE" in
+            proxy|mirror|cfcdn) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+rerender_nginx_sites() {
+    # 依赖本机 Nginx 地址（LOCAL_SERVICE）的站点类型重新生成配置；direct 无配置，public 用自身端口。
+    for f in "$SITES_DIR"/*.env; do
+        [ -f "$f" ] || continue
+        HOSTNAME= TARGET= MODE= UPSTREAM_HOST= CUSTOM_HOST= LISTEN_PORT=
+        # shellcheck disable=SC1090
+        . "$f"
+        [ -n "$HOSTNAME" ] || continue
+        case "$MODE" in
+            proxy|mirror|cfcdn)
+                if ! render_site_nginx "$HOSTNAME" "$TARGET" "$MODE" "$UPSTREAM_HOST" "$CUSTOM_HOST" "$LISTEN_PORT" >/dev/null 2>&1; then
+                    err "重新生成 Nginx 配置失败：$HOSTNAME"
+                    return 1
+                fi
+                ;;
+        esac
+    done
+    return 0
 }
 
 cf_api_request() {
